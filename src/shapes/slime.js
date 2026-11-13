@@ -17,7 +17,9 @@ export const slimeShape = {
     return { geometry, rest, index, vertexCount, floorY: 0, spacing: spacing ?? pickSpacing(), bounds };
   },
 
-  physics: { firmness: 0.4, recovery: 0.62, damping: 0.45, tack: 1.0 },
+  // Optional per-shape overrides of CONFIG.defaults.physics (the 말랑이 preset).
+  // Empty: this shape boots with exactly the preset the UI shows as selected.
+  physics: {},
   material: 'mochi',
   color: 'strawberry',
 

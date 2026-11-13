@@ -10,9 +10,13 @@ import { resolvePhysics, getFeelPreset } from '../src/physics/presets.js';
  * No three.js: this file builds its own geodesic icosphere (each face split
  * into an n x n barycentric grid, shared vertices deduped by rounded
  * coordinates) so `node tests/physics.smoke.mjs` runs the exact solver the
- * browser runs. Two configs: (n = 24, spacing 0.14) and (n = 16, spacing 0.2).
+ * browser runs. Two configs: (n = 24, spacing 0.17) and (n = 16, spacing 0.24).
  *
- * Metrics are sampled EVERY 1/60 s of every scenario over the WHOLE mesh (no
+ * Time (v7): every duration in this file is REAL wall-clock seconds; a 1/60 s
+ * frame advances `SIM_FRAME = FRAME · timeScale` simulation seconds and
+ * `SUBSTEPS` fixed substeps. `updateDerived` receives simulation seconds.
+ *
+ * Metrics are sampled EVERY frame of every scenario over the WHOLE mesh (no
  * exclusions): flipped tetrahedra must stay 0, positions finite, and the
  * surface roughness of the SMOOTHED render surface (change of the
  * discrete-Laplacian magnitude)
@@ -25,8 +29,14 @@ import { resolvePhysics, getFeelPreset } from '../src/physics/presets.js';
  */
 
 const H = CONFIG.simulation.fixedDt;
+// Real time convention (v7): FRAME is wall-clock seconds, the solver runs
+// `timeScale` simulation seconds per real second, so a 1/60 s frame advances
+// `FRAME * timeScale / fixedDt` substeps. updateDerived receives SIMULATION
+// seconds.
+const TIME_SCALE = CONFIG.simulation.timeScale;
 const FRAME = 1 / 60;
-const SUBSTEPS = Math.round(FRAME / H);
+const SIM_FRAME = FRAME * TIME_SCALE;
+const SUBSTEPS = Math.round(SIM_FRAME / H);
 const SQUISHY = getFeelPreset('squishy').values;
 const SLOW = getFeelPreset('slow').values;
 const SLIME = getFeelPreset('slime').values;
@@ -35,6 +45,11 @@ const BOUNCY = getFeelPreset('bouncy').values;
 const ROUGH_P99_MAX = 0.15;
 const ROUGH_MAX_MAX = 0.45;
 const SHAPE_ERROR_MAX = 0.08;
+
+// Unit normal passed to beginGrab by the pull-only scenarios. Those scenarios
+// never push (setGrabPush stays 0), so the normal has no effect on the physics;
+// the A2 force tests below pass the real surface normal.
+const UP = { x: 0, y: 1, z: 0 };
 
 let failures = 0;
 
@@ -221,7 +236,7 @@ function randomTopVertex(body, rng) {
 function kneadCycle(body, sc, rng, pullHeight, dragX) {
   const vi = randomTopVertex(body, rng);
   const p = vertexPoint(body, vi);
-  const handle = body.beginGrab(p, CONFIG.grab.pull.radius);
+  const handle = body.beginGrab(p, CONFIG.grab.pull.radius, UP);
   sc.advance(0.25, (t) => body.setGrabTarget(handle, p.x + dragX * t, p.y + pullHeight * t, p.z));
   body.endGrab(handle);
   sc.advance(0.25);
@@ -267,7 +282,7 @@ function colorRange(body) {
 function foldGesture(body, sc) {
   const gi = midHeightExtreme(body, true);
   const gp = vertexPoint(body, gi);
-  const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+  const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
   const cx = body.centroid.x;
   const cz = body.centroid.z;
   const topY = body.bounds.maxY + 0.1;
@@ -417,11 +432,203 @@ function frontUpperHands(body, k) {
   return out;
 }
 
-/** Step the body one 1/60 s frame (all substeps + derived update). */
+/** Step the body one 1/60 s real frame (all substeps + derived update). */
 function stepFrame(body) {
   for (let s = 0; s < SUBSTEPS; s++) body.step(H);
-  body.updateDerived(FRAME);
+  body.updateDerived(SIM_FRAME);
 }
+
+/**
+ * Select the node patch a hand would grab around `point` and return it without
+ * leaving the hand active, so a test can drive the patch directly.
+ */
+function patchAt(body, point, radius) {
+  const handle = body.beginGrab(point, radius, UP);
+  const hand = body.hands[handle];
+  const idx = Int32Array.from(hand.idx.subarray(0, hand.count));
+  const w = Float32Array.from(hand.w.subarray(0, hand.count));
+  body.endGrab(handle);
+  return { idx, w };
+}
+
+/**
+ * Apply a lateral force of `force` body weights to a patch for one substep, the
+ * same velocity kick the A2 push uses: total impulse over the patch is
+ * `force · bodyWeight · h` along `-normal`.
+ */
+function applyPatchForce(body, patch, normal, force, h) {
+  const weight = body.totalRestVolume * body.params.gravity;
+  let sumWM = 0;
+  for (let g = 0; g < patch.idx.length; g++) sumWM += patch.w[g] / body.invMass[patch.idx[g]];
+  const { nodeVel } = body;
+  for (let g = 0; g < patch.idx.length; g++) {
+    const node = patch.idx[g];
+    const k = ((force * weight) / sumWM) * patch.w[g] * h;
+    nodeVel[node * 3] -= normal.x * k;
+    nodeVel[node * 3 + 1] -= normal.y * k;
+    nodeVel[node * 3 + 2] -= normal.z * k;
+  }
+}
+
+/**
+ * Idle drift: settle 1 s real with no hands, then measure the horizontal
+ * centroid displacement over the next 10 s real. The lattice must not creep.
+ */
+function idleDrift(body, preset, label) {
+  body.setParams(resolvePhysics(preset));
+  body.reset({ drop: false });
+  const settleSc = new Scenario(`${label}-settle`, body, { checkRoughness: false });
+  settleSc.advance(1.0);
+  settleSc.report();
+  const c0 = { x: body.centroid.x, z: body.centroid.z };
+  const sc = new Scenario(`${label}-drift`, body, { checkRoughness: false });
+  sc.advance(10.0);
+  const dx = body.centroid.x - c0.x;
+  const dz = body.centroid.z - c0.z;
+  const drift = Math.hypot(dx, dz);
+  console.log(`  ${label}: drift=${drift.toFixed(4)} (dx=${dx.toFixed(4)} dz=${dz.toFixed(4)})`);
+  check(`${label} idle drift <= 0.01`, drift <= 0.01, `drift=${drift.toFixed(4)}`);
+  sc.report();
+  return drift;
+}
+
+/**
+ * Push the side at mid height with a lateral force of `force` body weights for
+ * 2 s real; return the horizontal centroid displacement. `force` is applied
+ * directly to the selected patch (A1 has no force API yet).
+ */
+function sidePushDrift(body, force, label) {
+  body.setParams(resolvePhysics(SQUISHY));
+  body.reset({ drop: false });
+  const settleSc = new Scenario(`${label}-settle`, body, { checkRoughness: false });
+  settleSc.advance(CURVE_SETTLE);
+  settleSc.report();
+  const gi = midHeightExtreme(body, true);
+  const p = vertexPoint(body, gi);
+  const nrm = vertexNormal(body, gi);
+  const patch = patchAt(body, p, CONFIG.grab.pull.radius);
+  const c0 = { x: body.centroid.x, z: body.centroid.z };
+  const frames = Math.round(2.0 / FRAME);
+  for (let f = 0; f < frames; f++) {
+    for (let s = 0; s < SUBSTEPS; s++) {
+      applyPatchForce(body, patch, nrm, force, H);
+      body.step(H);
+    }
+    body.updateDerived(SIM_FRAME);
+  }
+  const dx = body.centroid.x - c0.x;
+  const dz = body.centroid.z - c0.z;
+  const moved = Math.hypot(dx, dz);
+  console.log(`  ${label}: force=${force}W moved=${moved.toFixed(4)} (dx=${dx.toFixed(4)} dz=${dz.toFixed(4)})`);
+  return moved;
+}
+
+/** The lowest surface vertex on the side (y <= 0.35, extreme x). */
+function lowSideVertex(body) {
+  let best = -Infinity;
+  let index = -1;
+  for (let i = 0; i < body.count; i++) {
+    const y = body.pos[i * 3 + 1];
+    if (y > 0.35) continue;
+    const x = body.pos[i * 3];
+    if (x > best) {
+      best = x;
+      index = i;
+    }
+  }
+  if (index < 0) throw new Error('lowSideVertex found no low side vertex');
+  return index;
+}
+
+/**
+ * A2.1 force -> depth: settle, grab the top of the body with the real outward
+ * normal, apply a constant push force (in body weights) for `seconds` real and
+ * return the final low-passed depth, the time to reach 90 % of it and the worst
+ * volume ratio / tet state seen. `track90` records the per-frame depth.
+ */
+function forceDepth(body, preset, force, label, { seconds = 1.5, track90 = false } = {}) {
+  body.setParams(resolvePhysics(preset));
+  body.reset({ drop: false });
+  const settleSc = new Scenario(`${label}-settle`, body, { checkRoughness: false });
+  settleSc.advance(CURVE_SETTLE);
+  settleSc.report();
+  const cx = body.centroid.x;
+  const cz = body.centroid.z;
+  const top = body.topHeightAt(cx, cz, CONFIG.grab.pull.radius);
+  const handle = body.beginGrab({ x: cx, y: top, z: cz }, CONFIG.grab.pull.radius, UP);
+  body.setGrabPush(handle, force);
+  const sc = new Scenario(label, body, { checkRoughness: false });
+  const depths = [];
+  let minVol = Infinity;
+  const frames = Math.round(seconds / FRAME);
+  for (let f = 0; f < frames; f++) {
+    for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+    body.updateDerived(SIM_FRAME);
+    sc.sample((f + 1) / frames);
+    depths.push(body.hands[handle].depth);
+    const vf = volumeFlip(body);
+    if (vf.volumeRatio < minVol) minVol = vf.volumeRatio;
+  }
+  const depth = body.hands[handle].depth;
+  let t90 = Infinity;
+  if (track90) {
+    const target = 0.9 * depth;
+    for (let f = 0; f < depths.length; f++) {
+      if (depths[f] >= target) {
+        t90 = (f + 1) * FRAME;
+        break;
+      }
+    }
+  }
+  body.endGrab(handle);
+  return { depth, t90, minVol, sc };
+}
+
+/**
+ * A2.1 stability: settle, grab a point with a given outward normal, hold a push
+ * force for `seconds` real and report the whole-mesh tet/volume invariants.
+ */
+function heldPush(body, preset, label, force, seconds, pick) {
+  body.setParams(resolvePhysics(preset));
+  body.reset({ drop: false });
+  const settleSc = new Scenario(`${label}-settle`, body, { checkRoughness: false });
+  settleSc.advance(CURVE_SETTLE);
+  settleSc.report();
+  const { point, normal } = pick(body);
+  const handle = body.beginGrab(point, CONFIG.grab.pull.radius, normal);
+  body.setGrabPush(handle, force);
+  const sc = new Scenario(label, body, { checkRoughness: false });
+  let minVol = Infinity;
+  const frames = Math.round(seconds / FRAME);
+  for (let f = 0; f < frames; f++) {
+    for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+    body.updateDerived(SIM_FRAME);
+    sc.sample((f + 1) / frames);
+    const vf = volumeFlip(body);
+    if (vf.volumeRatio < minVol) minVol = vf.volumeRatio;
+  }
+  sc.report();
+  check(`${label} volumeRatio >= 0.95`, minVol >= 0.95, `minVolumeRatio=${minVol.toFixed(4)}`);
+  body.endGrab(handle);
+  return sc;
+}
+
+const pickTop = (b) => {
+  const cx = b.centroid.x;
+  const cz = b.centroid.z;
+  const top = b.topHeightAt(cx, cz, CONFIG.grab.pull.radius);
+  return { point: { x: cx, y: top, z: cz }, normal: UP };
+};
+
+const pickMidSide = (b) => {
+  const gi = midHeightExtreme(b, true);
+  return { point: vertexPoint(b, gi), normal: surfaceNormalAt(b, gi) };
+};
+
+const pickLowSide = (b) => {
+  const gi = lowSideVertex(b);
+  return { point: vertexPoint(b, gi), normal: surfaceNormalAt(b, gi) };
+};
 
 /**
  * Cheap per-frame collapse metric: the total signed tet volume ratio and the
@@ -558,7 +765,7 @@ function stressRandom(body, label) {
     for (let f = 0; f < n; f++) {
       if (onFrame) onFrame((f + 1) / n);
       for (let s = 0; s < SUBSTEPS; s++) body.step(H);
-      body.updateDerived(FRAME);
+      body.updateDerived(SIM_FRAME);
       sample(gesture);
     }
   };
@@ -574,7 +781,7 @@ function stressRandom(body, label) {
       // pull, incl. off-target extreme drags up to maxDrag
       const vi = randomTopVertex(body, rng);
       const p = vertexPoint(body, vi);
-      const handle = body.beginGrab(p, pullRadius);
+      const handle = body.beginGrab(p, pullRadius, UP);
       const ang = rng() * Math.PI * 2;
       const drag = 0.4 + rng() * (maxDrag - 0.4);
       const dx = Math.cos(ang) * drag;
@@ -605,7 +812,7 @@ function stressRandom(body, label) {
       // fixed mid-height band, unlike foldGesture)
       const vi = randomTopVertex(body, rng);
       const gp = vertexPoint(body, vi);
-      const handle = body.beginGrab(gp, pullRadius);
+      const handle = body.beginGrab(gp, pullRadius, UP);
       const cx = body.centroid.x;
       const cz = body.centroid.z;
       const topY = body.bounds.maxY + 0.1;
@@ -657,7 +864,7 @@ function releaseCurve(body, preset, label) {  body.setParams(resolvePhysics(pres
   const settled = body.bounds.maxY;
   const gi = topVertex(body);
   const gp = vertexPoint(body, gi);
-  const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+  const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
   const sc = new Scenario(label, body, { checkRoughness: false });
   sc.advance(0.4, (t) => body.setGrabTarget(handle, gp.x, gp.y + 1.0 * t, gp.z));
   sc.advance(0.5);
@@ -667,13 +874,14 @@ function releaseCurve(body, preset, label) {  body.setParams(resolvePhysics(pres
   const maxY = new Float64Array(N);
   for (let f = 0; f < N; f++) {
     for (let s = 0; s < SUBSTEPS; s++) body.step(H);
-    body.updateDerived(FRAME);
+    body.updateDerived(SIM_FRAME);
     maxY[f] = body.bounds.maxY;
   }
   const metrics = curveMetrics(maxY, settled, D0, 'release');
   console.log(
     `  ${label}: settled=${settled.toFixed(3)} D0=${D0.toFixed(3)} t50=${fmt(metrics.t50)} ` +
-      `under=${metrics.under.toFixed(4)} settle=${metrics.settle.toFixed(3)} finite=${finitePositions(body)}`
+      `under=${metrics.under.toFixed(4)} settle=${metrics.settle.toFixed(3)} ` +
+      `crossings=${metrics.crossings} finite=${finitePositions(body)}`
   );
   check(`${label} finite positions`, finitePositions(body), 'non-finite after release');
   sc.report();
@@ -681,41 +889,45 @@ function releaseCurve(body, preset, label) {  body.setParams(resolvePhysics(pres
 }
 
 /**
- * Press curve: settle, palm-press the top to 0.6·settled over 0.4 s, hold 0.6 s,
- * release, then sample maxY every frame for 5 s. Same metrics as the release
- * curve, computed on maxY rising back.
+ * Drop curve: settle (checking the settled height and volume), record the
+ * settled height, drop from CONFIG.simulation.dropHeight, then sample maxY and
+ * floor contact every real frame for 2 s. Returns the minimum maxY as a
+ * fraction of settled and the time to the first floor contact.
  */
-function pressCurve(body, preset, label) {
+function dropCurve(body, preset, label) {
   body.setParams(resolvePhysics(preset));
   body.reset({ drop: false });
   const settleSc = new Scenario(`${label}-settle`, body);
   settleSc.advance(CURVE_SETTLE);
   settleSc.report();
   const settled = body.bounds.maxY;
-  const x = body.centroid.x;
-  const z = body.centroid.z;
-  const top = body.topHeightAt(x, z, CONFIG.grab.press.radius);
-  body.beginPress(x, z, top, CONFIG.grab.press.radius);
-  const sc = new Scenario(label, body, { checkRoughness: false });
-  sc.advance(0.4, (t) => body.setPress(x, z, top + (0.6 * settled - top) * t));
-  sc.advance(0.6);
-  const D0 = settled - body.bounds.maxY;
-  body.endPress();
-  const N = Math.round(5.0 / FRAME);
-  const maxY = new Float64Array(N);
+  const settleStats = body.stats();
+  check(`${label}-settle height >= 0.90 x 1.66`, settled >= 0.90 * 1.66, `height=${settled.toFixed(3)}`);
+  check(
+    `${label}-settle volumeRatio in [0.97, 1.03]`,
+    settleStats.volumeRatio >= 0.97 && settleStats.volumeRatio <= 1.03,
+    `volumeRatio=${settleStats.volumeRatio.toFixed(4)}`
+  );
+  body.drop(CONFIG.simulation.dropHeight);
+  const sc = new Scenario(`${label}-drop`, body, { checkRoughness: false });
+  const N = Math.round(2.0 / FRAME);
+  let minMaxY = Infinity;
+  let firstContact = Infinity;
   for (let f = 0; f < N; f++) {
     for (let s = 0; s < SUBSTEPS; s++) body.step(H);
-    body.updateDerived(FRAME);
-    maxY[f] = body.bounds.maxY;
+    body.updateDerived(SIM_FRAME);
+    sc.sample((f + 1) / N);
+    if (body.bounds.maxY < minMaxY) minMaxY = body.bounds.maxY;
+    if (firstContact === Infinity && body.contact.count > 0) firstContact = (f + 1) * FRAME;
   }
-  const metrics = curveMetrics(maxY, settled, D0, 'press');
+  const minRatio = minMaxY / settled;
   console.log(
-    `  ${label}: settled=${settled.toFixed(3)} D0=${D0.toFixed(3)} t50=${fmt(metrics.t50)} ` +
-      `under=${metrics.under.toFixed(4)} settle=${metrics.settle.toFixed(3)} finite=${finitePositions(body)}`
+    `  ${label}-drop: settled=${settled.toFixed(3)} minRatio=${minRatio.toFixed(4)} ` +
+      `firstContact=${fmt(firstContact)} finite=${finitePositions(body)}`
   );
-  check(`${label} finite positions`, finitePositions(body), 'non-finite after release');
+  check(`${label}-drop finite positions`, finitePositions(body), 'non-finite after drop');
   sc.report();
-  return metrics;
+  return { minRatio, firstContact };
 }
 
 const fmt = (v) => (Number.isFinite(v) ? v.toFixed(3) : 'inf');
@@ -739,22 +951,59 @@ function curveMetrics(maxY, settled, D0, kind) {
   for (let f = 0; f < N; f++) {
     if (Math.abs(maxY[f] - settled) > 0.01 * settled) lastOut = f;
   }
-  return { t50, under, settle: (lastOut + 1) * FRAME };
+  // Zero crossings of the settled height, with a small hysteresis band so
+  // numerical jitter around the settled value is not counted as a wobble.
+  let crossings = 0;
+  let sign = 0;
+  const band = 0.01 * D0;
+  for (let f = 0; f < N; f++) {
+    const dev = maxY[f] - settled;
+    if (dev > band) {
+      if (sign < 0) crossings += 1;
+      sign = 1;
+    } else if (dev < -band) {
+      if (sign > 0) crossings += 1;
+      sign = -1;
+    }
+  }
+  return { t50, under, settle: (lastOut + 1) * FRAME, crossings };
 }
 
-/** Assert a release/press curve against a preset's t50/under/settle windows. */
-function checkCurve(label, metrics, { t50Min, t50Max, underMax, underMin = 0, settleMax }) {
+/** Assert a release curve against a preset's undershoot / crossings / quiet row. */
+function checkReleaseRow(label, metrics, row) {
   check(
-    `${label} t50 in [${t50Min}, ${t50Max}]`,
-    metrics.t50 >= t50Min && metrics.t50 <= t50Max,
-    `t50=${fmt(metrics.t50)}`
-  );
-  check(
-    `${label} under in [${underMin}, ${underMax}]`,
-    metrics.under >= underMin && metrics.under <= underMax,
+    `${label} undershoot in [${row.underMin}, ${row.underMax}]`,
+    metrics.under >= row.underMin && metrics.under <= row.underMax,
     `under=${metrics.under.toFixed(4)}`
   );
-  check(`${label} settle <= ${settleMax}`, metrics.settle <= settleMax, `settle=${metrics.settle.toFixed(3)}`);
+  check(
+    `${label} zero crossings in [${row.crossMin}, ${row.crossMax}]`,
+    metrics.crossings >= row.crossMin && metrics.crossings <= row.crossMax,
+    `crossings=${metrics.crossings}`
+  );
+  if (row.quietMax !== undefined) {
+    check(`${label} quiet <= ${row.quietMax}`, metrics.settle <= row.quietMax, `settle=${metrics.settle.toFixed(3)}`);
+  }
+  if (row.t50Min !== undefined) {
+    check(`${label} t50 in [${row.t50Min}, ${row.t50Max}]`, metrics.t50 >= row.t50Min && metrics.t50 <= row.t50Max, `t50=${fmt(metrics.t50)}`);
+  }
+  if (row.settledBy !== undefined) {
+    check(`${label} settled by ${row.settledBy}`, metrics.settle <= row.settledBy, `settle=${metrics.settle.toFixed(3)}`);
+  }
+}
+
+/** Assert a drop curve against a preset's min-height / first-contact row. */
+function checkDropRow(label, metrics, row) {
+  check(
+    `${label} min height ratio in [${row.minMin}, ${row.minMax}]`,
+    metrics.minRatio >= row.minMin && metrics.minRatio <= row.minMax,
+    `minRatio=${metrics.minRatio.toFixed(4)}`
+  );
+  check(
+    `${label} time to first contact in [${row.contactMin}, ${row.contactMax}]`,
+    metrics.firstContact >= row.contactMin && metrics.firstContact <= row.contactMax,
+    `firstContact=${fmt(metrics.firstContact)}`
+  );
 }
 
 /**
@@ -779,7 +1028,7 @@ class Scenario {
     for (let f = 0; f < frames; f++) {
       if (onFrame) onFrame((f + 1) / frames);
       for (let s = 0; s < SUBSTEPS; s++) this.body.step(H);
-      this.body.updateDerived(FRAME);
+      this.body.updateDerived(SIM_FRAME);
       this.sample((f + 1) / frames);
     }
   }
@@ -878,7 +1127,7 @@ function runConfig(n, spacing) {
     const baseMaxY = body.bounds.maxY;
     const gi = topVertex(body);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('pull-small', body);
     sc.advance(0.5, (t) => body.setGrabTarget(handle, gp.x, gp.y + 1.0 * t, gp.z));
     sc.advance(1.0);
@@ -910,7 +1159,7 @@ function runConfig(n, spacing) {
     const settledContact = body.contact.radius;
     const gi = topVertex(body);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('hang', body);
     sc.advance(0.6, (t) => body.setGrabTarget(handle, gp.x, gp.y + 2.4 * t, gp.z));
     sc.advance(1.5);
@@ -975,7 +1224,7 @@ function runConfig(n, spacing) {
     const settledContactX = body.contact.x;
     const gi = midHeightExtreme(body, true);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('side-pull', body);
     sc.advance(0.5, (t) => body.setGrabTarget(handle, gp.x + 1.4 * t, gp.y + 0.25 * t, gp.z));
     sc.advance(0.6);
@@ -1013,7 +1262,7 @@ function runConfig(n, spacing) {
     const nrm = vertexNormal(body, gi);
     const dented = { x: gp.x - nrm.x * 0.16, y: gp.y - nrm.y * 0.16, z: gp.z - nrm.z * 0.16 };
     const target = { x: gp.x + 0.25, y: gp.y + 1.2, z: gp.z };
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('front-pull', body);
     sc.advance(0.15, () => body.setGrabTarget(handle, dented.x, dented.y, dented.z));
     sc.advance(0.4, (t) => body.setGrabTarget(handle, lerp(dented.x, target.x, t), lerp(dented.y, target.y, t), lerp(dented.z, target.z, t)));
@@ -1039,7 +1288,7 @@ function runConfig(n, spacing) {
     const slimeSettledMaxY = body.bounds.maxY;
     const gi = topVertex(body);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('slime', body);
     sc.advance(0.5, (t) => body.setGrabTarget(handle, gp.x, gp.y + 1.2 * t, gp.z));
     body.endGrab(handle);
@@ -1078,7 +1327,7 @@ function runConfig(n, spacing) {
     settle('flick');
     const gi = midHeightExtreme(body, true);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('flick-release', body);
     sc.advance(0.05, (t) => body.setGrabTarget(handle, gp.x + 2.0 * t, gp.y, gp.z));
     body.endGrab(handle);
@@ -1157,8 +1406,8 @@ function runConfig(n, spacing) {
     const right = midHeightExtreme(body, true);
     const lp = vertexPoint(body, left);
     const rp = vertexPoint(body, right);
-    const hl = body.beginGrab(lp, CONFIG.grab.pull.radius);
-    const hr = body.beginGrab(rp, CONFIG.grab.pull.radius);
+    const hl = body.beginGrab(lp, CONFIG.grab.pull.radius, UP);
+    const hr = body.beginGrab(rp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('two-hands', body, { checkRoughness: false });
     sc.advance(0.5, (t) => {
       body.setGrabTarget(hl, lp.x - 1.0 * t, lp.y, lp.z);
@@ -1185,7 +1434,7 @@ function runConfig(n, spacing) {
     const nrm = vertexNormal(body, gi);
     body.paintColor(gp, 0.55, [0.2, 0.4, 1.0]);
     body.pokeAt(gp, nrm, 1.6);
-    body.updateDerived(FRAME);
+    body.updateDerived(SIM_FRAME);
     const painted = colorVariance(body);
     const sc = new Scenario('paint-visible', body, { checkRoughness: false });
     sc.advance(1.0);
@@ -1276,7 +1525,7 @@ function runConfig(n, spacing) {
     }
     const picks = [top, left, right, front, back];
     const targets = picks.map((vi) => vertexPoint(body, vi));
-    const handles = picks.map((vi, k) => body.beginGrab(targets[k], CONFIG.grab.pull.radius));
+    const handles = picks.map((vi, k) => body.beginGrab(targets[k], CONFIG.grab.pull.radius, UP));
     const sc = new Scenario('five-hands', body, { checkRoughness: false });
     sc.advance(0.5, (t) => {
       for (let k = 0; k < handles.length; k++) {
@@ -1317,7 +1566,7 @@ function runConfig(n, spacing) {
     const cz = body.centroid.z;
     const picks = upperHemisphereHands(body, 10);
     const targets = picks.map((vi) => vertexPoint(body, vi));
-    const handles = picks.map((vi, k) => body.beginGrab(targets[k], CONFIG.grab.pull.radius));
+    const handles = picks.map((vi, k) => body.beginGrab(targets[k], CONFIG.grab.pull.radius, UP));
     const sc = new Scenario('ten-hands', body, { checkRoughness: false });
     sc.advance(0.5, (t) => {
       for (let k = 0; k < handles.length; k++) {
@@ -1347,7 +1596,7 @@ function runConfig(n, spacing) {
     const cz = body.centroid.z;
     const normals = picks.map((vi) => surfaceNormalAt(body, vi));
     const base = picks.map((vi) => vertexPoint(body, vi));
-    const handles = picks.map((vi, k) => body.beginGrab(base[k], CONFIG.grab.pull.radius));
+    const handles = picks.map((vi, k) => body.beginGrab(base[k], CONFIG.grab.pull.radius, normals[k]));
     const sc = new Scenario('five-fingers-browser', body, { checkRoughness: false });
     let minVol = Infinity;
 
@@ -1401,7 +1650,7 @@ function runConfig(n, spacing) {
       for (let f = 0; f < frames; f++) {
         if (onFrame) onFrame((f + 1) / frames);
         for (let s = 0; s < SUBSTEPS; s++) body.step(H);
-        body.updateDerived(FRAME);
+        body.updateDerived(SIM_FRAME);
         sc.sample((f + 1) / frames);
         const vr = body.stats().volumeRatio;
         if (vr < minVol) minVol = vr;
@@ -1424,18 +1673,18 @@ function runConfig(n, spacing) {
     rel.report();
   }
 
-  // A10 release curves: the four presets each recover in their own way.
+  // A1.3 release/drop table: the four presets each recover in their own way.
   {
     const relSq = releaseCurve(body, SQUISHY, 'release-curve-squishy');
-    checkCurve('release-curve-squishy', relSq, { t50Min: 0.12, t50Max: 0.35, underMax: 0.06, settleMax: 1.5 });
+    checkReleaseRow('release-curve-squishy', relSq, { underMin: 0.10, underMax: 0.30, crossMin: 2, crossMax: 5, quietMax: 0.45 });
 
     const relSlow = releaseCurve(body, SLOW, 'release-curve-slow');
-    checkCurve('release-curve-slow', relSlow, { t50Min: 0.8, t50Max: 2.0, underMax: 0.01, settleMax: 5 });
+    checkReleaseRow('release-curve-slow', relSlow, { underMin: 0, underMax: 0.02, crossMin: 0, crossMax: 1, t50Min: 0.6, t50Max: 1.5, settledBy: 6 });
 
     const relBouncy = releaseCurve(body, BOUNCY, 'release-curve-bouncy');
-    checkCurve('release-curve-bouncy', relBouncy, { t50Min: 0, t50Max: 0.12, underMin: 0.05, underMax: 0.3, settleMax: 5 });
+    checkReleaseRow('release-curve-bouncy', relBouncy, { underMin: 0.15, underMax: 0.35, crossMin: 2, crossMax: 6, quietMax: 0.35 });
 
-    // slime: keeps the pull (plastic memory).
+    // slime: keeps the pull (plastic memory); shape is the release target.
     body.setParams(resolvePhysics(SLIME));
     body.reset({ drop: false });
     const settleSc = new Scenario('release-curve-slime-settle', body);
@@ -1444,7 +1693,7 @@ function runConfig(n, spacing) {
     const settled = body.bounds.maxY;
     const gi = topVertex(body);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('release-curve-slime', body, { checkRoughness: false });
     sc.advance(0.4, (t) => body.setGrabTarget(handle, gp.x, gp.y + 1.0 * t, gp.z));
     sc.advance(0.5);
@@ -1455,15 +1704,12 @@ function runConfig(n, spacing) {
     console.log(`  release-curve-slime: settled=${settled.toFixed(3)} D0=${D0.toFixed(3)} kept=${kept.toFixed(3)}`);
     check('release-curve-slime keeps maxY >= settled + 0.3 D0', kept >= 0.3 * D0, `kept=${kept.toFixed(3)} D0=${D0.toFixed(3)}`);
     sc.report();
-  }
 
-  // A10 press curves: 말랑이 and 슬로우 recover from a deep palm press.
-  {
-    const pSq = pressCurve(body, SQUISHY, 'press-curve-squishy');
-    checkCurve('press-curve-squishy', pSq, { t50Min: 0.12, t50Max: 0.35, underMax: 0.06, settleMax: 1.5 });
-
-    const pSlow = pressCurve(body, SLOW, 'press-curve-slow');
-    checkCurve('press-curve-slow', pSlow, { t50Min: 0.8, t50Max: 2.0, underMax: 0.01, settleMax: 5 });
+    // Drop curves: min height ratio and time to first contact, all four presets.
+    checkDropRow('drop-curve-squishy', dropCurve(body, SQUISHY, 'drop-curve-squishy'), { minMin: 0.80, minMax: 0.90, contactMin: 0.08, contactMax: 0.13 });
+    checkDropRow('drop-curve-slow', dropCurve(body, SLOW, 'drop-curve-slow'), { minMin: 0.90, minMax: 0.99, contactMin: 0.08, contactMax: 0.14 });
+    checkDropRow('drop-curve-bouncy', dropCurve(body, BOUNCY, 'drop-curve-bouncy'), { minMin: 0.84, minMax: 0.94, contactMin: 0.08, contactMax: 0.13 });
+    checkDropRow('drop-curve-slime', dropCurve(body, SLIME, 'drop-curve-slime'), { minMin: 0.82, minMax: 0.93, contactMin: 0.08, contactMax: 0.13 });
   }
 
   // A10 stretch attribute: ~1 at rest, >= 1.4 under a pull.
@@ -1481,7 +1727,7 @@ function runConfig(n, spacing) {
     check('stretch-attr at rest all in [0.9, 1.1]', lo >= 0.9 && hi <= 1.1, `[${lo.toFixed(3)}, ${hi.toFixed(3)}]`);
     const gi = topVertex(body);
     const gp = vertexPoint(body, gi);
-    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, UP);
     const sc = new Scenario('stretch-attr', body, { checkRoughness: false });
     let maxS = 0;
     sc.advance(0.5, (t) => {
@@ -1510,11 +1756,190 @@ function runConfig(n, spacing) {
     stressRandom(body, 'stress-random');
   }
 
+  // A1.1 idle drift: the lattice must not creep under gravity (all presets).
+  {
+    idleDrift(body, SQUISHY, 'drift-squishy');
+    idleDrift(body, SLOW, 'drift-slow');
+    idleDrift(body, SLIME, 'drift-slime');
+    idleDrift(body, BOUNCY, 'drift-bouncy');
+  }
+
+  // A1.4 Coulomb floor friction: a 0.4-weight side push holds, 1.5 weights slide.
+  {
+    const movedSmall = sidePushDrift(body, 0.4, 'friction-static');
+    check('friction-static 0.4-weight push holds (<= 0.15)', movedSmall <= 0.15, `moved=${movedSmall.toFixed(4)}`);
+    const movedBig = sidePushDrift(body, 1.5, 'friction-slide');
+    check('friction-slide 1.5-weight push slides (> 0.5)', movedBig > 0.5, `moved=${movedBig.toFixed(4)}`);
+  }
+
+  // A2.1 force -> depth: a finger push is a force, and the material decides how
+  // deep it sinks. Depth read after 1.5 s real; F in units of the body's weight.
+  {
+    const rows = [
+      { id: 'squishy', values: SQUISHY, low: [0.12, 0.28], high: [0.65, 1.0], t90: [0, 0.6] },
+      { id: 'bouncy', values: BOUNCY, low: [0, 0.06], high: [0.1, 0.32], t90: [0, 0.3] },
+      { id: 'slow', values: SLOW, low: [0.1, 0.3], high: [0.7, 1.1], t90: [0.5, 2.5] },
+      { id: 'slime', values: SLIME, low: [0.15, 0.4], high: [0.8, 1.2], t90: null },
+    ];
+    for (const row of rows) {
+      const low = forceDepth(body, row.values, 0.06, `push-depth-${row.id}-low`);
+      console.log(`  push-depth-${row.id} F=0.06 depth=${low.depth.toFixed(3)} minVol=${low.minVol.toFixed(4)}`);
+      check(
+        `push-depth-${row.id} F=0.06 in [${row.low[0]}, ${row.low[1]}]`,
+        low.depth >= row.low[0] && low.depth <= row.low[1],
+        `depth=${low.depth.toFixed(3)}`
+      );
+      const high = forceDepth(body, row.values, 0.8, `push-depth-${row.id}-high`, { track90: true });
+      console.log(
+        `  push-depth-${row.id} F=0.80 depth=${high.depth.toFixed(3)} t90=${fmt(high.t90)} minVol=${high.minVol.toFixed(4)}`
+      );
+      check(
+        `push-depth-${row.id} F=0.80 in [${row.high[0]}, ${row.high[1]}]`,
+        high.depth >= row.high[0] && high.depth <= row.high[1],
+        `depth=${high.depth.toFixed(3)}`
+      );
+      if (row.t90) {
+        check(
+          `push-depth-${row.id} t90 in [${row.t90[0]}, ${row.t90[1]}]`,
+          high.t90 >= row.t90[0] && high.t90 <= row.t90[1],
+          `t90=${fmt(high.t90)}`
+        );
+      }
+      check(`push-depth-${row.id} volumeRatio >= 0.95`, high.minVol >= 0.95, `minVolumeRatio=${high.minVol.toFixed(4)}`);
+    }
+  }
+
+  // A2.1 stability: a hard push on the top / side / low side must not flip a tet
+  // or lose volume.
+  {
+    heldPush(body, SQUISHY, 'push-top', 1.0, 3.0, pickTop);
+    heldPush(body, SQUISHY, 'push-mid-side', 1.0, 3.0, pickMidSide);
+    heldPush(body, SQUISHY, 'push-low-side', 1.0, 3.0, pickLowSide);
+  }
+
+  // A2.1 stability: five fingers at F = 0.8 each on the upper hemisphere.
+  {
+    body.setParams(resolvePhysics(SQUISHY));
+    body.reset({ drop: false });
+    const settleSc = new Scenario('push-five-hands-settle', body, { checkRoughness: false });
+    settleSc.advance(CURVE_SETTLE);
+    settleSc.report();
+    const picks = upperHemisphereHands(body, 5);
+    const handles = picks.map((vi) =>
+      body.beginGrab(vertexPoint(body, vi), CONFIG.grab.pull.radius, surfaceNormalAt(body, vi))
+    );
+    for (const h of handles) body.setGrabPush(h, 0.8);
+    const sc = new Scenario('push-five-hands', body, { checkRoughness: false });
+    let minVol = Infinity;
+    const frames = Math.round(3.0 / FRAME);
+    for (let f = 0; f < frames; f++) {
+      for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+      body.updateDerived(SIM_FRAME);
+      sc.sample((f + 1) / frames);
+      const vf = volumeFlip(body);
+      if (vf.volumeRatio < minVol) minVol = vf.volumeRatio;
+    }
+    sc.report();
+    check('push-five-hands volumeRatio >= 0.95', minVol >= 0.95, `minVolumeRatio=${minVol.toFixed(4)}`);
+    for (const h of handles) body.endGrab(h);
+  }
+
+  // A2.1 stability: push 1.0, then drag the hand outward 1.5 while the push
+  // fades to 0; the patch must follow the drag.
+  {
+    body.setParams(resolvePhysics(SQUISHY));
+    body.reset({ drop: false });
+    const settleSc = new Scenario('push-drag-settle', body, { checkRoughness: false });
+    settleSc.advance(CURVE_SETTLE);
+    settleSc.report();
+    const gi = midHeightExtreme(body, true);
+    const gp = vertexPoint(body, gi);
+    const handle = body.beginGrab(gp, CONFIG.grab.pull.radius, surfaceNormalAt(body, gi));
+    body.setGrabPush(handle, 1.0);
+    for (let f = 0; f < Math.round(1.0 / FRAME); f++) {
+      for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+      body.updateDerived(SIM_FRAME);
+    }
+    const target = { x: gp.x + 1.5, y: gp.y, z: gp.z };
+    const frames = Math.round(0.5 / FRAME);
+    for (let f = 0; f < frames; f++) {
+      const t = (f + 1) / frames;
+      body.setGrabPush(handle, 1.0 * (1 - t));
+      body.setGrabTarget(handle, gp.x + 1.5 * t, gp.y, gp.z);
+      for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+      body.updateDerived(SIM_FRAME);
+    }
+    const center = body.hands[handle].center;
+    const dist = Math.hypot(center.x - target.x, center.y - target.y, center.z - target.z);
+    console.log(`  push-drag patch centre dist to target=${dist.toFixed(4)}`);
+    check('push-drag patch follows within 0.15', dist <= 0.15, `dist=${dist.toFixed(4)}`);
+    check('push-drag finite positions', finitePositions(body), 'non-finite after drag');
+    check('push-drag flipped === 0', body.countFlipped() === 0, `flipped=${body.countFlipped()}`);
+    body.endGrab(handle);
+  }
+
+  // A2.2 signals: a drop reports exactly one frame with impact > 3; an idle
+  // settled body is quiet.
+  {
+    body.setParams(resolvePhysics(SQUISHY));
+    body.reset({ drop: false });
+    const idleSc = new Scenario('signals-idle', body, { checkRoughness: false });
+    idleSc.advance(1.0);
+    idleSc.report();
+    console.log(
+      `  signals-idle deformRate=${body.signals.deformRate.toFixed(4)} impact=${body.signals.impact.toFixed(4)} ` +
+        `weldBreaks=${body.signals.weldBreaks} depthRate=${body.signals.depthRate.toFixed(4)}`
+    );
+    check('signals idle deformRate < 0.05', body.signals.deformRate < 0.05, `deformRate=${body.signals.deformRate.toFixed(4)}`);
+    check('signals idle impact === 0', body.signals.impact === 0, `impact=${body.signals.impact}`);
+
+    body.setParams(resolvePhysics(SQUISHY));
+    body.reset({ drop: true });
+    let impactFrames = 0;
+    let maxImpact = 0;
+    const frames = Math.round(1.5 / FRAME);
+    for (let f = 0; f < frames; f++) {
+      for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+      body.updateDerived(SIM_FRAME);
+      if (body.signals.impact > 3) impactFrames += 1;
+      if (body.signals.impact > maxImpact) maxImpact = body.signals.impact;
+    }
+    console.log(`  signals-drop impactFrames=${impactFrames} maxImpact=${maxImpact.toFixed(3)}`);
+    check('signals drop exactly one impact frame > 3', impactFrames === 1, `impactFrames=${impactFrames} maxImpact=${maxImpact.toFixed(3)}`);
+  }
+
+  if (process.env.A2_SCAN) {
+    for (const [id, values] of [['squishy', SQUISHY], ['bouncy', BOUNCY], ['slow', SLOW], ['slime', SLIME]]) {
+      const line = [];
+      for (const F of [0.03, 0.06, 0.1, 0.2, 0.4, 0.8, 1.2]) {
+        line.push(`${F}=${forceDepth(body, values, F, `scan-${id}-${F}`).depth.toFixed(3)}`);
+      }
+      console.log(`SCAN ${id} depth: ${line.join(' ')}`);
+      body.setParams(resolvePhysics(values));
+      body.reset({ drop: false });
+      const s0 = new Scenario(`scan-${id}-trace-settle`, body, { checkRoughness: false });
+      s0.advance(CURVE_SETTLE);
+      const scx = body.centroid.x;
+      const scz = body.centroid.z;
+      const stop = body.topHeightAt(scx, scz, CONFIG.grab.pull.radius);
+      const h = body.beginGrab({ x: scx, y: stop, z: scz }, CONFIG.grab.pull.radius, UP);
+      body.setGrabPush(h, 0.8);
+      const tr = [];
+      for (let f = 0; f < Math.round(1.5 / FRAME); f++) {
+        for (let s = 0; s < SUBSTEPS; s++) body.step(H);
+        body.updateDerived(SIM_FRAME);
+        if (f % 6 === 0) tr.push(`${((f + 1) * FRAME).toFixed(2)}:${body.hands[h].depth.toFixed(3)}`);
+      }
+      body.endGrab(h);
+      console.log(`SCAN ${id} trace: ${tr.join(' ')}`);
+    }
+  }
+
   // A10 perf: 5 hands active, desktop config targets.
   {
     reset(SQUISHY);
     const picks = upperHemisphereHands(body, 5);
-    const handles = picks.map((vi) => body.beginGrab(vertexPoint(body, vi), CONFIG.grab.pull.radius));
+    const handles = picks.map((vi) => body.beginGrab(vertexPoint(body, vi), CONFIG.grab.pull.radius, UP));
     const steps = 600;
     let stepMs = 0;
     let derivedMs = 0;
@@ -1523,7 +1948,7 @@ function runConfig(n, spacing) {
       body.step(H);
       stepMs += performance.now() - t0;
       t0 = performance.now();
-      body.updateDerived(FRAME);
+      body.updateDerived(SIM_FRAME);
       derivedMs += performance.now() - t0;
     }
     const perStep = stepMs / steps;

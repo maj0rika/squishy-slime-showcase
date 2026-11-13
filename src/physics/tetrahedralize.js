@@ -269,14 +269,34 @@ export function tetrahedralize({ surfacePos, index, spacing }) {
       for (let k = 0; k < cellZ; k++) {
         const ci = cellIndex(i, j, k);
         if (!kept[ci]) continue;
+        // Lattice isotropy (v7): every cell used to share the same main
+        // diagonal (0,0,0)->(1,1,1), which makes the lattice softer in shear
+        // along that one direction and lets the body creep toward +x/+z under
+        // gravity. Mirroring the Kuhn decomposition on odd cell indices gives
+        // neighbouring cells the opposite diagonal, so the shear bias averages
+        // out. The mirror is a bijection on the cube corners, so shared faces
+        // stay conforming; a mirror across an odd number of axes flips a tet's
+        // orientation, which the `vol < 0` swap below restores.
+        const mirrorX = (i & 1) === 1;
+        const mirrorY = (j & 1) === 1;
+        const mirrorZ = (k & 1) === 1;
         for (let p = 0; p < 6; p++) {
           const perm = PERMUTATIONS[p];
           const a1 = AXES[perm[0]];
           const a2 = AXES[perm[1]];
-          const n0 = getNode(i, j, k);
-          const n1 = getNode(i + a1[0], j + a1[1], k + a1[2]);
-          const n2 = getNode(i + a1[0] + a2[0], j + a1[1] + a2[1], k + a1[2] + a2[2]);
-          const n3 = getNode(i + 1, j + 1, k + 1);
+          const m0x = mirrorX ? 1 : 0;
+          const m0y = mirrorY ? 1 : 0;
+          const m0z = mirrorZ ? 1 : 0;
+          const m1x = mirrorX ? 1 - a1[0] : a1[0];
+          const m1y = mirrorY ? 1 - a1[1] : a1[1];
+          const m1z = mirrorZ ? 1 - a1[2] : a1[2];
+          const m2x = mirrorX ? 1 - (a1[0] + a2[0]) : a1[0] + a2[0];
+          const m2y = mirrorY ? 1 - (a1[1] + a2[1]) : a1[1] + a2[1];
+          const m2z = mirrorZ ? 1 - (a1[2] + a2[2]) : a1[2] + a2[2];
+          const n0 = getNode(i + m0x, j + m0y, k + m0z);
+          const n1 = getNode(i + m1x, j + m1y, k + m1z);
+          const n2 = getNode(i + m2x, j + m2y, k + m2z);
+          const n3 = getNode(i + 1 - m0x, j + 1 - m0y, k + 1 - m0z);
 
           const p0 = n0 * 3;
           const p1 = n1 * 3;

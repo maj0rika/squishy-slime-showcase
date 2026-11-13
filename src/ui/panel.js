@@ -34,6 +34,7 @@ const TEMPLATE = `
     <div class="actions actions--grid">
       <button class="btn" id="btn-reset" type="button">초기화</button>
       <button class="btn" id="btn-pause" type="button" aria-pressed="false">일시정지</button>
+      <button class="btn" id="btn-sound" type="button" aria-pressed="true">소리 켜짐</button>
       <button class="btn" id="btn-poke" type="button">톡 찌르기</button>
       <button class="btn" id="btn-drop" type="button">떨어뜨리기</button>
     </div>
@@ -84,6 +85,7 @@ export class Panel {
     onPhysics,
     onReset,
     onPause,
+    onSound,
     onPoke,
     onDrop,
     onDebug,
@@ -95,9 +97,11 @@ export class Panel {
     this.onPhysics = onPhysics;
     this.onReset = onReset;
     this.onPause = onPause;
+    this.onSound = onSound;
     this.onPoke = onPoke;
     this.onDrop = onDrop;
     this.onDebug = onDebug;
+    this.soundOn = true;
 
     root.innerHTML = TEMPLATE;
 
@@ -111,6 +115,7 @@ export class Panel {
       fields: this.$('fields'),
       reset: this.$('btn-reset'),
       pause: this.$('btn-pause'),
+      sound: this.$('btn-sound'),
       poke: this.$('btn-poke'),
       drop: this.$('btn-drop'),
       debug: this.$('debug-disclosure'),
@@ -236,6 +241,7 @@ export class Panel {
   bind() {
     this.refs.reset.addEventListener('click', () => this.onReset());
     this.refs.pause.addEventListener('click', () => this.onPause());
+    this.refs.sound.addEventListener('click', () => this.onSound(!this.soundOn));
     this.refs.poke.addEventListener('click', () => this.onPoke());
     this.refs.drop.addEventListener('click', () => this.onDrop());
 
@@ -285,6 +291,12 @@ export class Panel {
   setPaused(paused) {
     this.refs.pause.textContent = paused ? '재개' : '일시정지';
     this.refs.pause.setAttribute('aria-pressed', String(paused));
+  }
+
+  setSound(on) {
+    this.soundOn = on;
+    this.refs.sound.textContent = on ? '소리 켜짐' : '소리 꺼짐';
+    this.refs.sound.setAttribute('aria-pressed', String(on));
   }
 
   setMeta(shapeName, materialLabel) {

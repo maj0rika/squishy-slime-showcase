@@ -22,10 +22,10 @@ export const PHYSICS_PRESET = {
  *   탱탱볼  bouncy ball: firm, snaps back fast with a lively rebound
  */
 export const FEEL_PRESETS = [
-  { id: 'squishy', label: '말랑이', values: { firmness: 0.3, recovery: 0.62, damping: 0.45, tack: 1.0, fuse: 1, weldBreak: 1.35, edgeMix: 0.015, weldMix: 0.25, weldLife: 0.5, viscoRelease: 200, shapeRate: 17 } },
-  { id: 'slow', label: '슬로우', values: { firmness: 0.1, recovery: 0.36, damping: 0.9, tack: 1.2, fuse: 1, weldBreak: 1.35, edgeMix: 0.02, weldMix: 0.3, weldLife: 0.5, viscoRelease: 1200, shapeRate: 0.6 } },
-  { id: 'slime', label: '슬라임', values: { firmness: 0.22, recovery: 0.04, damping: 0.7, tack: 1.6, fuse: 1, weldBreak: 4.0, edgeMix: 0.06, weldMix: 0.6, weldLife: 1e9, viscoRelease: 0, shapeRate: 0 } },
-  { id: 'bouncy', label: '탱탱볼', values: { firmness: 0.8, recovery: 0.95, damping: 0.1, tack: 0.45, fuse: 0, weldBreak: 1.0, edgeMix: 0.003, weldMix: 0.05, weldLife: 0.0, viscoRelease: 20, shapeRate: 2.2 } },
+  { id: 'squishy', label: '말랑이', values: { firmness: 0.2, recovery: 0.62, damping: 0.2, tack: 1.0, fuse: 1, weldBreak: 1.35, edgeMix: 0.015, weldMix: 0.25, weldLife: 0.5, viscoRelease: 8, creepTime: 0, shapeRate: 6, pushGain: 1.3 } },
+  { id: 'slow', label: '슬로우', values: { firmness: 0.35, recovery: 0.36, damping: 0.9, tack: 1.2, fuse: 1, weldBreak: 1.35, edgeMix: 0.02, weldMix: 0.3, weldLife: 0.5, viscoRelease: 0, creepTime: 0.12, shapeRate: 0.3, pushGain: 4 } },
+  { id: 'slime', label: '슬라임', values: { firmness: 0.4, recovery: 0.04, damping: 0.7, tack: 1.6, fuse: 1, weldBreak: 4.0, edgeMix: 0.06, weldMix: 0.6, weldLife: 1e9, viscoRelease: 0, creepTime: 0, shapeRate: 0, pushGain: 2.2 } },
+  { id: 'bouncy', label: '탱탱볼', values: { firmness: 0.8, recovery: 0.95, damping: 0.1, tack: 0.45, fuse: 0, weldBreak: 1.0, edgeMix: 0.003, weldMix: 0.05, weldLife: 0.0, viscoRelease: 10, creepTime: 0, shapeRate: 2.2, pushGain: 3 } },
 ];
 
 export function getFeelPreset(id) {
@@ -65,8 +65,8 @@ function smoothstep(edge0, edge1, x) {
  * The simulation is a tetrahedral solid: edge and tet-volume constraints give
  * interior material that resists the tangential buckling a hollow shell suffers.
  */
-export function resolvePhysics({ firmness: f, recovery: r, damping: d, tack, fuse, weldBreak, edgeMix, weldMix, weldLife, viscoRelease, shapeRate }) {
-  const required = { tack, fuse, weldBreak, edgeMix, weldMix, weldLife, viscoRelease, shapeRate };
+export function resolvePhysics({ firmness: f, recovery: r, damping: d, tack, fuse, weldBreak, edgeMix, weldMix, weldLife, viscoRelease, creepTime, shapeRate, pushGain }) {
+  const required = { tack, fuse, weldBreak, edgeMix, weldMix, weldLife, viscoRelease, creepTime, shapeRate, pushGain };
   const bad = Object.keys(required).filter((key) => !Number.isFinite(required[key]));
   if (bad.length > 0) {
     throw new Error(`resolvePhysics requires finite ${bad.join(', ')}`);
@@ -91,7 +91,8 @@ export function resolvePhysics({ firmness: f, recovery: r, damping: d, tack, fus
     weldMix,
     weldLife,
     viscoRelease,
-    dentDepth: CONFIG.grab.pull.dentDepth * lerp(1.0, 0.45, f),
+    creepTime,
+    pushGain,
     skinSmoothIterations: 2,
   };
 }

@@ -16,6 +16,8 @@ import {
 } from './render/materials.js';
 import { CameraRig } from './input/camera.js';
 import { PointerController } from './input/pointer.js';
+import { SquishAudio } from './audio/squishAudio.js';
+import { FingerProxy } from './render/fingerProxy.js';
 import { Panel } from './ui/panel.js';
 import { DebugLayer } from './ui/debug.js';
 
@@ -45,6 +47,9 @@ export class App {
     this.renderMode = 'skinned';
     this.debug = null;
     this.pointer = null;
+    this.audio = null;
+    this.fingerProxy = null;
+    this.soundOn = localStorage.getItem('squish.sound') !== 'off';
   }
 
   async init() {
@@ -57,6 +62,11 @@ export class App {
       CONFIG.camera.far
     );
     this.rig = new CameraRig(this.camera, this.canvas);
+
+    this.audio = new SquishAudio({ baseUrl: './assets/audio/' });
+    this.audio.setMaterial(CONFIG.defaults.feel);
+    this.audio.setEnabled(this.soundOn);
+    this.fingerProxy = new FingerProxy({ scene: this.stage.scene });
 
     this.state = {
       color: CONFIG.defaults.color,
@@ -75,10 +85,12 @@ export class App {
       onPhysics: (patch) => this.setPhysics(patch),
       onReset: () => this.reset(),
       onPause: () => this.togglePause(),
+      onSound: (on) => this.setSound(on),
       onPoke: () => this.poke(),
       onDrop: () => this.drop(),
       onDebug: (open) => this.applyDebug(open),
     });
+    this.panel.setSound(this.soundOn);
 
     this.mountShape(getShape('slime'), { frame: true });
 
@@ -91,7 +103,23 @@ export class App {
       controls: this.rig.controls,
       rig: this.rig,
       floorY: this.floorY,
+      onGrabStart: () => this.audio.grabStart(),
+      onGrabEnd: (depth) => this.audio.grabEnd(depth),
     });
+
+    // The first touch anywhere on the stage unlocks Web Audio (a user gesture
+    // is required). A failure is reported in the status pill and rethrown.
+    this.onFirstPointer = () => {
+      this.audio.unlock().then(
+        () => this.audio.setEnabled(this.soundOn),
+        (error) => {
+          this.statusEl.dataset.error = 'true';
+          this.statusTextEl.textContent = `소리 로드 실패 · ${error.message}`;
+          throw error;
+        }
+      );
+    };
+    this.stageEl.addEventListener('pointerdown', this.onFirstPointer, { once: true });
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.stageEl);
@@ -231,8 +259,16 @@ export class App {
     this.state.feel = id;
     this.state.physics = { ...preset.values };
     this.applyPhysics();
+    this.audio.setMaterial(id);
     this.panel.setPhysics(this.state.physics);
     this.panel.setFeel(id);
+  }
+
+  setSound(on) {
+    this.soundOn = on;
+    localStorage.setItem('squish.sound', on ? 'on' : 'off');
+    this.audio.setEnabled(on);
+    this.panel.setSound(on);
   }
 
   setPhysics(patch) {
@@ -273,6 +309,7 @@ export class App {
     this.state.physics = { ...CONFIG.defaults.physics, ...this.shapeDef.physics };
     this.state.feel = 'squishy';
     this.applyPhysics();
+    this.audio.setMaterial('squishy');
     this.panel.setPhysics(this.state.physics);
     this.panel.setFeel('squishy');
     this.rig.reset(true);
@@ -385,10 +422,10 @@ export class App {
 
     this.pointer.update(dt);
 
+    const { fixedDt, maxSubsteps, timeScale } = CONFIG.simulation;
+    let steps = 0;
     if (!this.state.paused) {
-      this.accumulator += dt;
-      const { fixedDt, maxSubsteps } = CONFIG.simulation;
-      let steps = 0;
+      this.accumulator += dt * timeScale;
       while (this.accumulator >= fixedDt && steps < maxSubsteps) {
         this.body.step(fixedDt);
         this.accumulator -= fixedDt;
@@ -397,13 +434,23 @@ export class App {
       if (steps === maxSubsteps) this.accumulator = 0;
     }
 
-    this.body.updateDerived(dt);
+    // updateDerived takes SIMULATION seconds; 0 while paused.
+    this.body.updateDerived(steps * fixedDt);
     this.surface.sync();
     if (this.renderMode === 'implicit') this.implicit.sync();
 
     if (!this.pointer.active) this.rig.follow(this.body.centroid, dt);
     this.rig.update(dt);
     this.stage.update({ centroid: this.body.centroid, contact: this.body.contact, dt });
+
+    // Feedback: sound and the visible finger read the solver's post-step state.
+    this.audio.update({
+      dt,
+      signals: this.body.signals,
+      dragTravel: this.pointer.consumeDragTravel(),
+    });
+    this.fingerProxy.update({ fingers: this.pointer.fingers(), camera: this.camera, dt });
+
     this.debug.update();
     this.stage.render(this.camera);
 
@@ -422,7 +469,10 @@ export class App {
     this.resizeObserver.disconnect();
     window.removeEventListener('resize', this.onResize);
     this.canvas.removeEventListener('dblclick', this.onDoubleClick);
+    this.stageEl.removeEventListener('pointerdown', this.onFirstPointer);
     this.pointer.dispose();
+    this.audio.dispose();
+    this.fingerProxy.dispose();
     this.rig.dispose();
     this.surface.geometry.dispose();
     this.material.dispose();

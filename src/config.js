@@ -4,9 +4,22 @@
  */
 
 export const CONFIG = {
+  /**
+   * Real-world scale. One simulation unit is 3.6 cm, so the toy is about 7 cm
+   * wide and 6 cm tall. Gravity 30 units/s² in simulation time equals 9.8 m/s²
+   * only when simulation time runs `simulation.timeScale` (= 3) times faster
+   * than wall-clock time, which is what the main loop does.
+   */
+  scale: {
+    unitCm: 3.6,
+  },
+
   simulation: {
-    fixedDt: 1 / 360,
-    maxSubsteps: 8,
+    // Simulation seconds per substep. With timeScale 3 a 60 fps frame advances
+    // 3/60 simulation seconds = 9 substeps.
+    fixedDt: 1 / 180,
+    timeScale: 3,
+    maxSubsteps: 14,
     maxFrameDt: 0.05,
     gravity: 30,
     maxSpeed: 30,
@@ -35,6 +48,20 @@ export const CONFIG = {
       holdSinkPerSecond: 0.6,
       holdMaxDepth: 0.5,
       holdMaxRadius: 0.62,
+      // Finger push force, in units of the body's own weight (v7). The pointer
+      // layer turns touch/hold/contact-area into a force; the solver turns the
+      // force into a depth that depends on the material.
+      push: {
+        touch: 0.06,
+        touchEaseSeconds: 0.06,
+        holdStartSeconds: 0.15,
+        holdPerSecond: 0.45,
+        holdMax: 0.8,
+        areaGain: 0.5,
+        max: 1.0,
+        pullDecay: 0.3,
+        freeForce: 0.05,
+      },
     },
     press: {
       radius: 1.25,
@@ -84,6 +111,6 @@ export const CONFIG = {
     material: 'mochi',
     tool: 'pull',
     feel: 'squishy',
-    physics: { firmness: 0.3, recovery: 0.62, damping: 0.45, tack: 1.0, fuse: 1, weldBreak: 1.35, edgeMix: 0.015, weldMix: 0.25, weldLife: 0.5, viscoRelease: 200, shapeRate: 17 },
+    physics: { firmness: 0.2, recovery: 0.62, damping: 0.2, tack: 1.0, fuse: 1, weldBreak: 1.35, edgeMix: 0.015, weldMix: 0.25, weldLife: 0.5, viscoRelease: 8, creepTime: 0, shapeRate: 6, pushGain: 1.3 },
   },
 };

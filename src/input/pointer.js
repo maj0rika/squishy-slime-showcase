@@ -10,24 +10,23 @@ const _normal = new THREE.Vector3();
 const _target = new THREE.Vector3();
 
 const PULL = CONFIG.grab.pull;
+const PUSH = PULL.push;
 const PRESS = CONFIG.grab.press;
 
 /** Pointer movement (in CSS px) below which a held pointer counts as "still". */
 const HOLD_STILL_PX = 6;
-/** Once a pointer has moved past this, the sink stops growing and decays. */
+/** Once a pointer has moved past this, its hold force stops growing for good. */
 const HOLD_MOVE_PX = 12;
-/** A still pointer must be held this long before the sink starts. */
-const HOLD_START_SECONDS = 0.18;
-/** The grab radius is re-selected this often while sinking. */
-const HOLD_RADIUS_INTERVAL_MS = 100;
 /** World units of drag per haptic tick while a hand is being dragged. */
 const HAPTIC_DRAG_STEP = 0.25;
 
 /**
  * Gesture input — no tool switching.
  *
- *   Left mouse / one finger on the blob  → grab. Drag up/out to stretch,
- *     drag down into the body to squash and spread, hold still to sink in.
+ *   Left mouse / one finger on the blob  → grab. A touch is a FORCE along the
+ *     surface normal, not a scripted offset: the finger pushes the patch in and
+ *     the material decides how deep it goes. Holding still deepens the push;
+ *     dragging out fades the push so the pin takes over and the patch stretches.
  *     Every pointer on the blob starts its own hand until
  *     `CONFIG.grab.maxHands` are active: five or more fingers can stretch,
  *     fold and knead at once. Further pointers are ignored.
@@ -43,7 +42,7 @@ const HAPTIC_DRAG_STEP = 0.25;
  * haptic tick. The capability is checked once; when absent it is never called.
  */
 export class PointerController {
-  constructor({ stageEl, canvas, camera, mesh, body, controls, rig, floorY }) {
+  constructor({ stageEl, canvas, camera, mesh, body, controls, rig, floorY, onGrabStart, onGrabEnd }) {
     this.stageEl = stageEl;
     this.canvas = canvas;
     this.camera = camera;
@@ -52,11 +51,14 @@ export class PointerController {
     this.controls = controls;
     this.rig = rig;
     this.floorY = floorY;
+    this.onGrabStart = onGrabStart;
+    this.onGrabEnd = onGrabEnd;
 
     this.enabled = true;
     this.shift = false;
     this.pointers = new Map();
     this.lastHoverAt = 0;
+    this.dragTravel = 0;
     this.haptics = typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
 
     this.onDown = this.onDown.bind(this);
@@ -102,6 +104,33 @@ export class PointerController {
       if (hand.kind === 'grab') n += 1;
     }
     return n;
+  }
+
+  /**
+   * One entry per active grab hand for the finger proxy: the pointer id,
+   * whether the finger should be drawn (a real touch finger is already there),
+   * and the solver's current contact centre and outward normal.
+   */
+  fingers() {
+    const fingers = [];
+    for (const hand of this.pointers.values()) {
+      if (hand.kind !== 'grab') continue;
+      const state = this.body.hands[hand.handle];
+      fingers.push({
+        id: hand.pointerId,
+        visible: hand.pointerType !== 'touch',
+        center: state.center,
+        normal: state.normal,
+      });
+    }
+    return fingers;
+  }
+
+  /** World distance every grab hand's drag vector moved since the last call. */
+  consumeDragTravel() {
+    const travel = this.dragTravel;
+    this.dragTravel = 0;
+    return travel;
   }
 
   /** Fire a haptic pattern only where the capability exists. */
@@ -156,18 +185,24 @@ export class PointerController {
     _normal.copy(hit.face.normal).transformDirection(this.mesh.matrixWorld).normalize();
     this.camera.getWorldDirection(_cameraDir);
 
+    // Contact area drives the area term of the push. Only touch reports a real
+    // contact size; a mouse/pen reports a constant size, so areaF stays 0.
+    const area0 = event.pointerType === 'touch' ? event.width * event.height : 0;
+
     const hand = {
       pointerId: event.pointerId,
       pointerType: event.pointerType,
       kind: 'grab',
-      handle: this.body.beginGrab(hit.point, PULL.radius),
+      handle: this.body.beginGrab(hit.point, PULL.radius, _normal.clone()),
       hitPoint: hit.point.clone(),
-      hitNormal: _normal.clone(),
       plane: new THREE.Plane().setFromNormalAndCoplanarPoint(_cameraDir, hit.point),
       drag: new THREE.Vector3(),
+      prevDrag: new THREE.Vector3(),
       hold: 0,
-      sink: 0,
-      lastRadiusAt: performance.now(),
+      holdF: 0,
+      holdLatched: false,
+      area: area0,
+      area0,
       startX: event.clientX,
       startY: event.clientY,
       moved: 0,
@@ -180,6 +215,7 @@ export class PointerController {
     this.canvas.setPointerCapture(event.pointerId);
     this.canvas.style.cursor = 'grabbing';
     this.syncControls();
+    this.onGrabStart();
   }
 
   beginPress(event, hit) {
@@ -228,6 +264,7 @@ export class PointerController {
         if (_drag.lengthSq() > max * max) _drag.setLength(max);
         hand.drag.copy(_drag);
       }
+      if (hand.pointerType === 'touch') hand.area = event.width * event.height;
       const ticks = Math.floor(hand.drag.length() / HAPTIC_DRAG_STEP);
       if (ticks > hand.dragTicks) {
         hand.dragTicks = ticks;
@@ -283,8 +320,15 @@ export class PointerController {
     }
     this.pointers.delete(pointerId);
 
-    if (hand.kind === 'grab') this.body.endGrab(hand.handle);
-    else this.body.endPress();
+    if (hand.kind === 'grab') {
+      // Read the pressed depth before the solver clears the hand: the audio
+      // layer uses it to decide whether the release pops.
+      const depth = this.body.hands[hand.handle].depth;
+      this.body.endGrab(hand.handle);
+      this.onGrabEnd(depth);
+    } else {
+      this.body.endPress();
+    }
 
     if (this.canvas.hasPointerCapture(pointerId)) {
       this.canvas.releasePointerCapture(pointerId);
@@ -298,37 +342,42 @@ export class PointerController {
     this.syncControls();
   }
 
-  /** Called every frame: drives each hand's target from the held pointer. */
+  /** Called every frame: drives each hand's force and target from the pointer. */
   update(dt) {
     if (this.pointers.size === 0) return;
-    const now = performance.now();
     for (const hand of this.pointers.values()) {
       hand.hold += dt;
-      if (hand.kind === 'grab') this.updateGrab(hand, dt, now);
-      else this.updatePress(hand);
+      if (hand.kind === 'grab') {
+        this.updateGrab(hand, dt);
+        this.dragTravel += hand.drag.distanceTo(hand.prevDrag);
+        hand.prevDrag.copy(hand.drag);
+      } else {
+        this.updatePress(hand);
+      }
     }
   }
 
-  updateGrab(hand, dt, now) {
-    const params = this.body.params;
-
-    if (hand.moved < HOLD_STILL_PX && hand.hold > HOLD_START_SECONDS) {
-      hand.sink = Math.min(hand.sink + PULL.holdSinkPerSecond * dt, PULL.holdMaxDepth);
-      if (now - hand.lastRadiusAt >= HOLD_RADIUS_INTERVAL_MS) {
-        const t = hand.sink / PULL.holdMaxDepth;
-        this.body.setGrabRadius(hand.handle, PULL.radius + (PULL.holdMaxRadius - PULL.radius) * t);
-        hand.lastRadiusAt = now;
+  updateGrab(hand, dt) {
+    // Hold force: a still finger sinks deeper. Once the finger has been dragged
+    // past HOLD_MOVE_PX the hold stops growing for good, so stretching the patch
+    // cannot keep deepening the press.
+    if (!hand.holdLatched) {
+      if (hand.moved < HOLD_STILL_PX && hand.hold > PUSH.holdStartSeconds) {
+        hand.holdF = Math.min(hand.holdF + PUSH.holdPerSecond * dt, PUSH.holdMax);
       }
-    } else if (hand.moved > HOLD_MOVE_PX) {
-      hand.sink *= Math.exp(-hand.drag.length() / PULL.dentDragDecay);
+      if (hand.moved > HOLD_MOVE_PX) hand.holdLatched = true;
     }
 
-    const ease = 1 - Math.exp(-hand.hold / PULL.dentEaseSeconds);
-    const decay = Math.exp(-hand.drag.length() / PULL.dentDragDecay);
-    const dent = params.dentDepth * ease * decay;
-    const depth = Math.max(dent, hand.sink);
+    const touchF = PUSH.touch * (1 - Math.exp(-hand.hold / PUSH.touchEaseSeconds));
+    const areaF = hand.area0 > 0
+      ? PUSH.areaGain * Math.min(Math.max(hand.area / hand.area0 - 1, 0), 1)
+      : 0;
+    const dragLength = hand.drag.length();
+    const force =
+      Math.min(PUSH.max, touchF + hand.holdF + areaF) * Math.exp(-dragLength / PUSH.pullDecay);
 
-    _target.copy(hand.hitPoint).add(hand.drag).addScaledVector(hand.hitNormal, -depth);
+    this.body.setGrabPush(hand.handle, force);
+    _target.copy(hand.hitPoint).add(hand.drag);
     this.body.setGrabTarget(hand.handle, _target.x, _target.y, _target.z);
   }
 

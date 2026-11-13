@@ -19,9 +19,9 @@ import { tetrahedralize } from './tetrahedralize.js';
  * spacing, boundaryCount, contact, centroid, hands, grabbed, activeHandCount,
  * press, floorY, normalsDirty, energy, maxDisp, nodeColor, surfaceColor,
  * colorVersion, surfaceStretch, stretchVersion, setParams, step, updateDerived,
- * beginGrab, setGrabTarget, setGrabRadius, endGrab, topHeightAt, beginPress,
- * setPress, endPress, pokeAt, setBaseColor, paintColor, drop, reset, stats) is
- * consumed by the render/input/UI layers.
+ * beginGrab, setGrabPush, setGrabTarget, setGrabRadius, endGrab, signals,
+ * topHeightAt, beginPress, setPress, endPress, pokeAt, setBaseColor, paintColor,
+ * drop, reset, stats) is consumed by the render/input/UI layers.
  */
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -34,6 +34,20 @@ const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
  * held base instead of dragging the whole blob across the floor.
  */
 const PEEL_LIFT = 1.5;
+
+/**
+ * Adaptive refinement. One solver sweep per substep cannot always carry a load
+ * (several pushing fingers, a finger dragging the body across the table) through
+ * the body, and a tet is left inverted after the inversion recovery. Only then
+ * up to REFINE_MAX more edge + volume + recovery iterations run in the same
+ * substep (also while two or more fingers carry more than REFINE_LOAD body
+ * weights together and a tet was inverted before the recovery), so a healthy
+ * body never pays for them and the calibrated force-to-depth response of a
+ * normal single push is untouched.
+ */
+const REFINE_LOAD = 1.5;
+const RECOVER_SCAN_RATIO = 0.4;
+const REFINE_MAX = 3;
 const SPREAD_FRICTION = 0.94;
 const FLOOR_CONTACT_EPS = 0.03;
 
@@ -62,6 +76,8 @@ const REQUIRED_PARAMS = Object.freeze([
   'weldMix',
   'weldLife',
   'viscoRelease',
+  'creepTime',
+  'pushGain',
   'skinSmoothIterations',
 ]);
 
@@ -280,6 +296,8 @@ export class SoftBody {
     this.shapeGoalReady = false;
     this.idleTime = 0;
     this.shapeMatchQuat = [0, 0, 0, 1];
+    this.creepQuat = [0, 0, 0, 1];
+    this.creepA = new Float64Array(9);
     // Recovery ramp (v4): the shape-matching memory is off while a gesture is
     // active and fades back in linearly over CONFIG.feel.shapeRampSeconds once
     // the last hand/press is released, so a released squishy rises smoothly
@@ -293,6 +311,14 @@ export class SoftBody {
     this.embedTet = tet.embedTet;
     this.embedBary = tet.embedBary;
 
+    // Total mass = Σ 1/invMass over the movable nodes; because each tet's rest
+    // volume is split evenly over its four vertices this equals the total rest
+    // volume. Body weight W = totalMass · gravity drives the finger force (v7).
+    this.totalMass = 0;
+    for (let i = 0; i < this.nodeCount; i++) {
+      if (this.invMass[i] > 0) this.totalMass += 1 / this.invMass[i];
+    }
+
     // Global volume constraint scratch (round 11): the accumulated per-node
     // gradient of the total tet volume, plus the target total rest volume.
     this.volumeGrad = new Float32Array(this.nodeCount * 3);
@@ -303,6 +329,7 @@ export class SoftBody {
     // into the rest shape.
     this.nodeInverted = new Uint8Array(this.nodeCount);
     this.invertedCount = 0;
+    this.minTetRatio = 1;
 
     // Displacement-field smoothing of the skinned surface (round 5): the render
     // surface is skinned from a coarse tet grid, so the displacement field is
@@ -344,6 +371,13 @@ export class SoftBody {
         active: false,
         target: { x: 0, y: 0, z: 0 },
         origin: { x: 0, y: 0, z: 0 },
+        // v7 finger force: `normal` is the unit outward surface normal at the
+        // touch, `push` the current force in body weights, `depth` the low-passed
+        // sink depth (positive = pushed in) and `center` the patch centroid.
+        normal: { x: 0, y: 1, z: 0 },
+        push: 0,
+        depth: 0,
+        center: { x: 0, y: 0, z: 0 },
         radius: 0,
         count: 0,
         idx: new Int32Array(this.nodeCount),
@@ -360,6 +394,9 @@ export class SoftBody {
     this.grabAccum = new Float32Array(this.nodeCount * 3);
     this.grabWeight = new Float32Array(this.nodeCount);
     this.grabTouched = new Int32Array(this.nodeCount);
+    // Per-node normal component of the pin correction that is released while a
+    // finger pushes (v7), subtracted in the averaged multi-hand solve.
+    this.grabRelease = new Float32Array(this.nodeCount * 3);
 
     // --- Self-collision + fusion ---------------------------------------------
     // Boundary nodes (fewer incident tets than a fully interior grid node) are
@@ -397,6 +434,7 @@ export class SoftBody {
     this.maxWelds = CONFIG.knead.maxWelds;
     this.collideRelax = 0.15;
     this.substepCount = 0;
+    this.peeling = false;
     this.collisions = 0;
 
     let hashCap = 16;
@@ -453,7 +491,7 @@ export class SoftBody {
       weldMix: 0.25,
       weldLife: 0.5,
       viscoRelease: 0,
-      dentDepth: CONFIG.grab.pull.dentDepth,
+      pushGain: 1,
       skinSmoothIterations: 2,
     };
 
@@ -465,6 +503,17 @@ export class SoftBody {
     this.maxDisp = 0;
     this.normalsDirty = true;
 
+    // Feedback signals (v7), refreshed once per updateDerived: how much the body
+    // is deforming, the last floor impact speed, welds broken and how fast the
+    // fingers are sinking. Consumed by the audio layer and the finger proxy.
+    this.signals = { deformRate: 0, impact: 0, weldBreaks: 0, depthRate: 0 };
+    this.impactPending = 0;
+    this.weldBreaksSinceUpdate = 0;
+    this.depthRateSum = 0;
+    this.stepsSinceUpdate = 0;
+    this.prevFloorContactCount = 0;
+    this.prevCentroidVelY = 0;
+
     this.updateDerived(0);
   }
 
@@ -474,6 +523,16 @@ export class SoftBody {
       if (this.hands[h].active) return true;
     }
     return false;
+  }
+
+  /** Total finger push of the active hands, in body weights. */
+  fingerLoad() {
+    let load = 0;
+    for (let h = 0; h < this.hands.length; h++) {
+      const hand = this.hands[h];
+      if (hand.active) load += hand.push;
+    }
+    return load;
   }
 
   /** Number of active hands. */
@@ -500,6 +559,11 @@ export class SoftBody {
   step(h) {
     const { nodePos, nodePrev, nodeVel, nodeCount, params } = this;
     const lin = Math.exp(-params.linearDamping * h);
+
+    // Finger force (v7): a push adds a velocity impulse to its patch along
+    // -normal before integration, so the total force on the patch is
+    // `push · W` and the material decides how deep it sinks.
+    if (this.grabbed) this.applyHandPush(h);
 
     for (let i = 0; i < nodeCount; i++) {
       const i3 = i * 3;
@@ -537,6 +601,7 @@ export class SoftBody {
     }
     this.substepCount += 1;
     this.solveFloorAndBounds(h);
+    if (params.creepTime > 0) this.applyCreepDamping(h);
     // The volume constraint runs after the floor clamp as well, so the
     // tetrahedra are restored to a positive volume once the contact and bounds
     // have pushed nodes around.
@@ -556,6 +621,7 @@ export class SoftBody {
       if (!hand.active) continue;
       activeHands += 1;
       if (
+        hand.push > 0 ||
         hand.target.x !== hand.origin.x ||
         hand.target.y !== hand.origin.y ||
         hand.target.z !== hand.origin.z
@@ -564,7 +630,7 @@ export class SoftBody {
       }
     }
     if (activeHands >= 3 && deforming) {
-      this.solveVolumes(params.volumeCompliance * invH2);
+      for (let k = 0; k < 4; k++) this.solveVolumes(params.volumeCompliance * invH2);
     }
     // A palm press at its crush floor is the one gesture that can crush a whole
     // layer of tets at once. While the press is down there, extra per-tet volume
@@ -583,7 +649,13 @@ export class SoftBody {
     // volume with zero compliance, up to 3 passes, after all the volume work for
     // this substep. This is the last correction before the velocity update, so a
     // crushed layer cannot stay inverted.
-    this.recoverInverted(3);
+    let inverted = this.recoverInverted(3);
+    if (!inverted && this.invertedCount > 0 && activeHands >= 2 && this.fingerLoad() > REFINE_LOAD) inverted = true;
+    for (let k = 0; k < REFINE_MAX && inverted; k++) {
+      this.solveEdges(alpha);
+      this.solveVolumes(params.volumeCompliance * invH2);
+      inverted = this.recoverInverted(3);
+    }
     // Global shape matching is the elastic "memory" of the presets that recover
     // (slime has shapeRate 0 and keeps its plastic shape). It is off while a
     // gesture is active, so a held pull/press is never fought by the memory, and
@@ -600,6 +672,9 @@ export class SoftBody {
       this.solveShapeMatching(h, params.shapeRate * this.shapeRamp);
     }
     this.breakWelds();
+    // Patch-level Coulomb static friction runs LAST, after every volume/shape
+    // pass, so no later correction can reintroduce rigid in-plane drift.
+    this.applyFloorStaticFriction(h);
 
     const maxSpeed = CONFIG.simulation.maxSpeed;
     for (let i = 0; i < nodeCount; i++) {
@@ -640,6 +715,105 @@ export class SoftBody {
     if (params.plasticRate > 0 && (this.grabbed || this.press.active)) {
       this.applyPlasticity(h);
     }
+
+    // Finger state and the per-substep signals the frame aggregates.
+    if (this.grabbed) this.updateHandState(h);
+    this.trackSubstepState();
+  }
+
+  /**
+   * Distribute a hand's push force over its patch as a velocity impulse. With
+   * node mass m_g = 1/invMass[g] and patch weight w_g, adding
+   *   Δv_g = -normal · (push · W / Σ(w_g·m_g)) · w_g · h
+   * to every patch node makes the total impulse on the patch `push · W · h`
+   * along -normal, i.e. a net force of `push · W` (W = totalMass · gravity).
+   */
+  applyHandPush(h) {
+    const { hands, nodeVel, invMass } = this;
+    const W = this.totalMass * this.params.gravity;
+    const gain = this.params.pushGain;
+    for (let hi = 0; hi < hands.length; hi++) {
+      const hand = hands[hi];
+      if (!hand.active || hand.push <= 0) continue;
+      let sumWM = 0;
+      for (let g = 0; g < hand.count; g++) sumWM += hand.w[g] / invMass[hand.idx[g]];
+      const n = hand.normal;
+      const c = ((hand.push * gain * W) / sumWM) * h;
+      for (let g = 0; g < hand.count; g++) {
+        const i3 = hand.idx[g] * 3;
+        const k = c * hand.w[g];
+        nodeVel[i3] -= n.x * k;
+        nodeVel[i3 + 1] -= n.y * k;
+        nodeVel[i3 + 2] -= n.z * k;
+      }
+    }
+  }
+
+  /**
+   * Per-substep hand state (v7): the low-passed sink depth and the patch centre
+   * over the nodes with w >= 0.6. The 20 ms low-pass keeps solver jitter out of
+   * the depth the audio layer reads; the centre is the finger proxy's anchor.
+   */
+  updateHandState(h) {
+    const { hands, nodePos } = this;
+    const tau = 0.02;
+    const alpha = 1 - Math.exp(-h / tau);
+    for (let hi = 0; hi < hands.length; hi++) {
+      const hand = hands[hi];
+      if (!hand.active) continue;
+      const n = hand.normal;
+      const target = hand.target;
+      let wsum = 0;
+      let sx = 0;
+      let sy = 0;
+      let sz = 0;
+      let dsum = 0;
+      for (let g = 0; g < hand.count; g++) {
+        const w = hand.w[g];
+        if (w < 0.6) continue;
+        const i3 = hand.idx[g] * 3;
+        const gx = target.x + hand.off[g * 3];
+        const gy = target.y + hand.off[g * 3 + 1];
+        const gz = target.z + hand.off[g * 3 + 2];
+        const d = (gx - nodePos[i3]) * n.x + (gy - nodePos[i3 + 1]) * n.y + (gz - nodePos[i3 + 2]) * n.z;
+        dsum += w * d;
+        sx += w * nodePos[i3];
+        sy += w * nodePos[i3 + 1];
+        sz += w * nodePos[i3 + 2];
+        wsum += w;
+      }
+      hand.center.x = sx / wsum;
+      hand.center.y = sy / wsum;
+      hand.center.z = sz / wsum;
+      const before = hand.depth;
+      hand.depth += (dsum / wsum - hand.depth) * alpha;
+      this.depthRateSum += (hand.depth - before) / h;
+    }
+  }
+
+  /**
+   * Per-substep bookkeeping for the feedback signals: floor-contact count and
+   * the node-centroid vertical speed. A 0 -> >0 contact transition during a
+   * frame records the downward speed of the substep just before first contact.
+   */
+  trackSubstepState() {
+    const { nodePos, nodeVel, nodeCount } = this;
+    const limit = this.floorY + FLOOR_CONTACT_EPS;
+    let contact = 0;
+    let vy = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      if (nodePos[i3 + 1] <= limit) contact += 1;
+      vy += nodeVel[i3 + 1];
+    }
+    vy /= nodeCount;
+    if (this.prevFloorContactCount === 0 && contact > 0) {
+      const speed = -this.prevCentroidVelY;
+      this.impactPending = speed > 0 ? speed : 0;
+    }
+    this.prevFloorContactCount = contact;
+    this.prevCentroidVelY = vy;
+    this.stepsSinceUpdate += 1;
   }
 
   /** XPBD distance constraints over the tet edges. `alpha` = compliance / h². */
@@ -673,6 +847,87 @@ export class SoftBody {
   }
 
   /**
+   * Kelvin-Voigt creep damping (memory foam). The solved substep displacement
+   * is split into the best-fit rigid motion (translation + rotation, Procrustes
+   * between the substep start and the solved positions) and the deformation
+   * left over; only the deformation is divided by `1 + creepTime / h`. Rigid
+   * motion, free fall and any static state (no net displacement) are therefore
+   * untouched, while a deformation can advance at a rate limited by
+   * `creepTime` regardless of the force driving it: resistance proportional to
+   * strain rate, i.e. a dashpot in parallel with the elastic constraints. The
+   * limit is applied to the solved result, so the elastic response is not
+   * weakened (a stateless per-substep solve cannot carry a damped constraint
+   * without losing static stiffness).
+   */
+  applyCreepDamping(h) {
+    const { nodePos, nodePrev, nodeCount, floorY, creepQuat } = this;
+    const keep = 1 / (1 + this.params.creepTime / h);
+    let cpx = 0;
+    let cpy = 0;
+    let cpz = 0;
+    let csx = 0;
+    let csy = 0;
+    let csz = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      cpx += nodePrev[i3];
+      cpy += nodePrev[i3 + 1];
+      cpz += nodePrev[i3 + 2];
+      csx += nodePos[i3];
+      csy += nodePos[i3 + 1];
+      csz += nodePos[i3 + 2];
+    }
+    cpx /= nodeCount;
+    cpy /= nodeCount;
+    cpz /= nodeCount;
+    csx /= nodeCount;
+    csy /= nodeCount;
+    csz /= nodeCount;
+    const A = this.creepA;
+    A.fill(0);
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      const px = nodePos[i3] - csx;
+      const py = nodePos[i3 + 1] - csy;
+      const pz = nodePos[i3 + 2] - csz;
+      const qx = nodePrev[i3] - cpx;
+      const qy = nodePrev[i3 + 1] - cpy;
+      const qz = nodePrev[i3 + 2] - cpz;
+      A[0] += px * qx;
+      A[1] += px * qy;
+      A[2] += px * qz;
+      A[3] += py * qx;
+      A[4] += py * qy;
+      A[5] += py * qz;
+      A[6] += pz * qx;
+      A[7] += pz * qy;
+      A[8] += pz * qz;
+    }
+    creepQuat[0] = 0;
+    creepQuat[1] = 0;
+    creepQuat[2] = 0;
+    creepQuat[3] = 1;
+    const R = extractRotation(A, creepQuat, 3);
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      const qx = nodePrev[i3] - cpx;
+      const qy = nodePrev[i3 + 1] - cpy;
+      const qz = nodePrev[i3 + 2] - cpz;
+      const rx = R[0] * qx + R[1] * qy + R[2] * qz + csx;
+      const ry = R[3] * qx + R[4] * qy + R[5] * qz + csy;
+      const rz = R[6] * qx + R[7] * qy + R[8] * qz + csz;
+      nodePos[i3] = rx + (nodePos[i3] - rx) * keep;
+      let y = ry + (nodePos[i3 + 1] - ry) * keep;
+      // The floor contact is a constraint, not deformation: a node resting on
+      // the table stays on it (unless the base is being peeled) and nothing
+      // sinks through it.
+      if (y < floorY || (!this.peeling && nodePrev[i3 + 1] <= floorY + FLOOR_CONTACT_EPS)) y = floorY;
+      nodePos[i3 + 1] = y;
+      nodePos[i3 + 2] = rz + (nodePos[i3 + 2] - rz) * keep;
+    }
+  }
+
+  /**
    * XPBD tet-volume constraints. `alpha` = compliance / h². The four gradients
    * are the cross products of the edge vectors divided by 6, unrolled here with
    * the four vertex positions cached in locals — this is the hot loop.
@@ -680,6 +935,7 @@ export class SoftBody {
   solveVolumes(alpha) {
     const { tets, tetRest0, tetCount, nodePos, invMass } = this;
     let inverted = 0;
+    let minRatio = Infinity;
     for (let t = 0; t < tetCount; t++) {
       const b = t * 4;
       const n0 = tets[b];
@@ -737,6 +993,8 @@ export class SoftBody {
 
       const volume = (e1x * g1x + e1y * g1y + e1z * g1z) / 1;
       if (volume <= 0) inverted += 1;
+      const ratio = volume / tetRest0[t];
+      if (ratio < minRatio) minRatio = ratio;
       const s = -(volume - tetRest0[t]) / (w + alpha);
 
       nodePos[i0] += g0x * s * im0;
@@ -753,8 +1011,10 @@ export class SoftBody {
       nodePos[i3 + 2] += g3z * s * im3;
     }
     // Recorded so `recoverInverted` can skip its own scan when the last volume
-    // pass saw no inverted tet (the common case), keeping the perf budget.
+    // pass saw no inverted or badly squeezed tet (the common case), keeping the
+    // perf budget.
     this.invertedCount = inverted;
+    this.minTetRatio = minRatio;
   }
 
   /**
@@ -865,11 +1125,13 @@ export class SoftBody {
    * the pass stops early once no tet is inverted.
    */
   recoverInverted(iterations) {
-    // Skip the scan entirely when the last volume pass saw no inverted tet.
-    if (this.invertedCount === 0) return;
+    // Skip the scan when the last volume pass saw no inverted and no badly
+    // squeezed tet (a Gauss-Seidel pass can leave a squeezed tet inverted).
+    if (this.invertedCount === 0 && this.minTetRatio > RECOVER_SCAN_RATIO) return false;
     const { tets, tetRest0, tetCount, nodePos, invMass } = this;
+    let any = false;
     for (let it = 0; it < iterations; it++) {
-      let any = false;
+      any = false;
       for (let t = 0; t < tetCount; t++) {
         const b = t * 4;
         const n0 = tets[b];
@@ -943,6 +1205,7 @@ export class SoftBody {
       }
       if (!any) break;
     }
+    return any;
   }
 
   /**
@@ -1050,23 +1313,39 @@ export class SoftBody {
     this.solveGrabAveraged();
   }
 
-  /** Original single-hand relaxation (unchanged arithmetic). */
+  /**
+   * Single-hand relaxation. The pin correction is split into its component
+   * along the hand normal and the tangential rest (v7): the tangential part is
+   * applied exactly as before, while the normal part is scaled by
+   * `1 - pushBlend` so a pushing finger lets the material decide the depth and
+   * the pin takes over smoothly as the pointer fades the push out during a pull.
+   */
   solveGrabSingle() {
     const { nodePos, hands } = this;
     const stiffness = this.params.grabStiffness;
+    const freeForce = CONFIG.grab.pull.push.freeForce;
+    const gain = this.params.pushGain;
     for (let h = 0; h < hands.length; h++) {
       const hand = hands[h];
       if (!hand.active) continue;
       const target = hand.target;
+      const n = hand.normal;
+      const pushBlend = clamp((hand.push * gain) / freeForce, 0, 1);
       for (let g = 0; g < hand.count; g++) {
         const i3 = hand.idx[g] * 3;
         const f = Math.min(1, stiffness * hand.w[g]);
-        const tx = target.x + hand.off[g * 3];
-        const ty = target.y + hand.off[g * 3 + 1];
-        const tz = target.z + hand.off[g * 3 + 2];
-        nodePos[i3] += (tx - nodePos[i3]) * f;
-        nodePos[i3 + 1] += (ty - nodePos[i3 + 1]) * f;
-        nodePos[i3 + 2] += (tz - nodePos[i3 + 2]) * f;
+        let dx = target.x + hand.off[g * 3] - nodePos[i3];
+        let dy = target.y + hand.off[g * 3 + 1] - nodePos[i3 + 1];
+        let dz = target.z + hand.off[g * 3 + 2] - nodePos[i3 + 2];
+        if (pushBlend > 0) {
+          const release = pushBlend * (dx * n.x + dy * n.y + dz * n.z);
+          dx -= release * n.x;
+          dy -= release * n.y;
+          dz -= release * n.z;
+        }
+        nodePos[i3] += dx * f;
+        nodePos[i3 + 1] += dy * f;
+        nodePos[i3 + 2] += dz * f;
       }
     }
   }
@@ -1079,23 +1358,41 @@ export class SoftBody {
    * weight-averaged target of the hands that touch it, with the correction
    * capped at full stiffness so a cluster of hands cannot move a shared node
    * more than the solver would for a single hand.
+   *
+   * Each hand's normal component is released by its own `pushBlend` (v7) before
+   * the average, so a cluster of pushing fingers leaves the shared nodes free
+   * along their own normals while their tangential pull still blends.
    */
   solveGrabAveraged() {
-    const { nodePos, hands, grabAccum, grabWeight, grabTouched } = this;
+    const { nodePos, hands, grabAccum, grabWeight, grabTouched, grabRelease } = this;
     const stiffness = this.params.grabStiffness;
+    const freeForce = CONFIG.grab.pull.push.freeForce;
+    const gain = this.params.pushGain;
     let touchedCount = 0;
     for (let h = 0; h < hands.length; h++) {
       const hand = hands[h];
       if (!hand.active) continue;
       const target = hand.target;
+      const n = hand.normal;
+      const pushBlend = clamp((hand.push * gain) / freeForce, 0, 1);
       for (let g = 0; g < hand.count; g++) {
         const node = hand.idx[g];
         const i3 = node * 3;
         const f = Math.min(1, stiffness * hand.w[g]);
+        const gx = target.x + hand.off[g * 3];
+        const gy = target.y + hand.off[g * 3 + 1];
+        const gz = target.z + hand.off[g * 3 + 2];
         if (grabWeight[node] === 0) grabTouched[touchedCount++] = node;
-        grabAccum[i3] += f * (target.x + hand.off[g * 3]);
-        grabAccum[i3 + 1] += f * (target.y + hand.off[g * 3 + 1]);
-        grabAccum[i3 + 2] += f * (target.z + hand.off[g * 3 + 2]);
+        grabAccum[i3] += f * gx;
+        grabAccum[i3 + 1] += f * gy;
+        grabAccum[i3 + 2] += f * gz;
+        if (pushBlend > 0) {
+          const dn = (gx - nodePos[i3]) * n.x + (gy - nodePos[i3 + 1]) * n.y + (gz - nodePos[i3 + 2]) * n.z;
+          const k = f * pushBlend * dn;
+          grabRelease[i3] += k * n.x;
+          grabRelease[i3 + 1] += k * n.y;
+          grabRelease[i3 + 2] += k * n.z;
+        }
         grabWeight[node] += f;
       }
     }
@@ -1107,9 +1404,9 @@ export class SoftBody {
       // pull a shared node more than the solver would for a single hand.
       const blend = wsum > 1 ? 1 : wsum;
       const inv = 1 / wsum;
-      const tx = grabAccum[i3] * inv;
-      const ty = grabAccum[i3 + 1] * inv;
-      const tz = grabAccum[i3 + 2] * inv;
+      const tx = (grabAccum[i3] - grabRelease[i3]) * inv;
+      const ty = (grabAccum[i3 + 1] - grabRelease[i3 + 1]) * inv;
+      const tz = (grabAccum[i3 + 2] - grabRelease[i3 + 2]) * inv;
       nodePos[i3] += (tx - nodePos[i3]) * blend;
       nodePos[i3 + 1] += (ty - nodePos[i3 + 1]) * blend;
       nodePos[i3 + 2] += (tz - nodePos[i3 + 2]) * blend;
@@ -1117,6 +1414,9 @@ export class SoftBody {
       grabAccum[i3] = 0;
       grabAccum[i3 + 1] = 0;
       grabAccum[i3 + 2] = 0;
+      grabRelease[i3] = 0;
+      grabRelease[i3 + 1] = 0;
+      grabRelease[i3 + 2] = 0;
     }
   }
 
@@ -1311,7 +1611,10 @@ export class SoftBody {
         nodePos[j3 + 1] - nodePos[i3 + 1],
         nodePos[j3 + 2] - nodePos[i3 + 2]
       );
-      if (length > breakFactor * weldRest[w]) this.removeWeldAt(w);
+      if (length > breakFactor * weldRest[w]) {
+        this.removeWeldAt(w);
+        this.weldBreaksSinceUpdate += 1;
+      }
     }
   }
 
@@ -1346,26 +1649,15 @@ export class SoftBody {
   }
 
   /**
-   * Floor contact. Static friction is Coulomb-like: a contact node stays stuck
-   * only while its per-substep tangential displacement is below
+   * Floor contact and world bounds. Per node, a contact node stays stuck only
+   * while its per-substep tangential displacement is below
    * `muStatic * penetration + tack`, where the `tack` term (`tackBreak * h`)
-   * applies only while a tool is active. Without a tool the base is free to
-   * relax, so the body recovers its settled shape after release. A palm press
-   * lets the contact spread outward, and a strong upward grab peels the whole
-   * contact off the table. The net in-plane drift of the contact patch is
-   * removed each substep so the body cannot simply slide as a whole. The
-   * ceiling and the horizontal radius bound always apply.
-   */
-  /**
-   * Floor contact. Static friction is Coulomb-like: a contact node stays stuck
-   * only while its per-substep tangential displacement is below
-   * `muStatic * penetration + tack`, where the `tack` term (`tackBreak * h`)
-   * applies only while a tool is active. Without a tool the base is free to
-   * slide, so the body relaxes back to its settled shape after release. A palm
+   * applies only while a tool is active; otherwise it slips by the kinetic
+   * fraction. The patch as a whole is held by the force-based Coulomb limit in
+   * `applyFloorStaticFriction`, which runs at the end of the substep. A palm
    * press lets the contact spread outward, and a strong upward grab peels the
-   * whole contact off the table. The net in-plane drift of the contact patch is
-   * removed each substep so the body cannot simply slide as a whole. The
-   * ceiling and the horizontal radius bound always apply.
+   * whole contact off the table. The ceiling and the horizontal radius bound
+   * always apply.
    */
   solveFloorAndBounds(h) {
     const { nodePos, nodePrev, nodeCount, floorY, contactIdx } = this;
@@ -1383,6 +1675,7 @@ export class SoftBody {
         break;
       }
     }
+    this.peeling = peel;
     const spread = this.press.active;
 
     let cn = 0;
@@ -1445,7 +1738,11 @@ export class SoftBody {
       }
     }
 
-    if (cn > 0 && !spread && !peel) {
+    // While a tool is active, hold the whole contact patch so a finger pull
+    // stretches the body against a stuck base instead of dragging it across the
+    // floor. (The no-tool case is held by the force-based Coulomb limit in
+    // `applyFloorStaticFriction`, which runs at the end of the substep.)
+    if (cn > 0 && toolActive && !spread && !peel) {
       const mdx = sumDx / cn;
       const mdz = sumDz / cn;
       for (let k = 0; k < cn; k++) {
@@ -1453,6 +1750,56 @@ export class SoftBody {
         nodePos[i3] -= mdx;
         nodePos[i3 + 2] -= mdz;
       }
+    }
+  }
+
+  /**
+   * Patch-level Coulomb static friction (v7). The floor holds the whole contact
+   * patch while the net tangential force the body asks it to carry is below the
+   * static limit `0.7 · tack · bodyWeight`; above that limit the patch slides
+   * (the per-node kinetic friction in `solveFloorAndBounds` bleeds it). The
+   * threshold is a force, not a per-substep displacement allowance, so it does
+   * not depend on the timestep. It runs at the end of the substep, after every
+   * volume and shape pass, so a later correction cannot reintroduce the rigid
+   * in-plane drift the old unconditional re-centering used to mask.
+   *
+   * A palm press spreads the base and a strong upward grab peels it, so both
+   * bypass the hold.
+   */
+  applyFloorStaticFriction(h) {
+    const { nodePos, nodePrev, nodeCount, floorY, invMass } = this;
+    // A palm press spreads the base and a tool gesture holds it (the grab path
+    // in `solveFloorAndBounds`); only the idle / force-push case is handled here.
+    if (this.press.active || this.grabbed) return;
+    // Net tangential momentum the body gained this substep, over ALL nodes:
+    // P = Σ m_i · Δx_i. |P|/h² is the net tangential force the floor must
+    // supply to keep the body put. Node mass is 1/invMass.
+    let px = 0;
+    let pz = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      const m = 1 / invMass[i];
+      px += m * (nodePos[i3] - nodePrev[i3]);
+      pz += m * (nodePos[i3 + 2] - nodePrev[i3 + 2]);
+    }
+    const weight = this.totalRestVolume * this.params.gravity;
+    const h2 = h * h;
+    if (Math.hypot(px, pz) / h2 > 0.7 * this.params.tackBreak * weight) return;
+    // Hold: cancel that momentum with a uniform tangential impulse over the
+    // contact patch (the only nodes the floor can act on).
+    let contactMass = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      if (nodePos[i * 3 + 1] > floorY + FLOOR_CONTACT_EPS) continue;
+      contactMass += 1 / invMass[i];
+    }
+    if (contactMass === 0) return;
+    const cx = -px / contactMass;
+    const cz = -pz / contactMass;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      if (nodePos[i3 + 1] > floorY + FLOOR_CONTACT_EPS) continue;
+      nodePos[i3] += cx;
+      nodePos[i3 + 2] += cz;
     }
   }
 
@@ -1836,6 +2183,40 @@ export class SoftBody {
     }
     this.nodeBounds = { minX: nMinX, minY: nMinY, minZ: nMinZ, maxX: nMaxX, maxY: nMaxY, maxZ: nMaxZ };
 
+    // Feedback signals (v7). `deformRate` is the RMS deviation of the node
+    // velocities from their mean at the last substep; `impact` the downward
+    // centroid speed just before a floor contact that began during this frame;
+    // `weldBreaks` the welds snapped since the last update; `depthRate` the sum
+    // over active hands of d(depth)/dt, positive while the fingers sink.
+    let meanVx = 0;
+    let meanVy = 0;
+    let meanVz = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      meanVx += nodeVel[i3];
+      meanVy += nodeVel[i3 + 1];
+      meanVz += nodeVel[i3 + 2];
+    }
+    meanVx /= nodeCount;
+    meanVy /= nodeCount;
+    meanVz /= nodeCount;
+    let deformSq = 0;
+    for (let i = 0; i < nodeCount; i++) {
+      const i3 = i * 3;
+      const dx = nodeVel[i3] - meanVx;
+      const dy = nodeVel[i3 + 1] - meanVy;
+      const dz = nodeVel[i3 + 2] - meanVz;
+      deformSq += dx * dx + dy * dy + dz * dz;
+    }
+    this.signals.deformRate = Math.sqrt(deformSq / nodeCount);
+    this.signals.impact = this.impactPending;
+    this.signals.weldBreaks = this.weldBreaksSinceUpdate;
+    this.signals.depthRate = this.stepsSinceUpdate > 0 ? this.depthRateSum / this.stepsSinceUpdate : 0;
+    this.impactPending = 0;
+    this.weldBreaksSinceUpdate = 0;
+    this.depthRateSum = 0;
+    this.stepsSinceUpdate = 0;
+
     // Temporary welds age only while the body is left alone; then the render
     // surface colours are mixed from the kneading motion and interpolated from
     // the node colours through the embedding.
@@ -1985,8 +2366,21 @@ export class SoftBody {
     hand.radius = radius;
   }
 
-  /** Start a grab; returns the hand handle. Throws if no hand is free. */
-  beginGrab(point, radius) {
+  /**
+   * Start a grab; returns the hand handle. `normal` is the unit outward surface
+   * normal at the touch and is required (missing or non-finite throws); the
+   * force-driven finger pushes the patch along -normal. Throws if no hand is
+   * free.
+   */
+  beginGrab(point, radius, normal) {
+    if (
+      !normal ||
+      !Number.isFinite(normal.x) ||
+      !Number.isFinite(normal.y) ||
+      !Number.isFinite(normal.z)
+    ) {
+      throw new Error('SoftBody.beginGrab requires a finite unit normal {x, y, z}');
+    }
     let handle = -1;
     for (let h = 0; h < this.hands.length; h++) {
       if (!this.hands[h].active) {
@@ -2000,12 +2394,16 @@ export class SoftBody {
     const hand = this.hands[handle];
     hand.target = { x: point.x, y: point.y, z: point.z };
     hand.origin = { x: point.x, y: point.y, z: point.z };
+    hand.normal = { x: normal.x, y: normal.y, z: normal.z };
+    hand.push = 0;
+    hand.depth = 0;
+    hand.center = { x: point.x, y: point.y, z: point.z };
     this.selectHand(hand, point, radius);
     hand.active = true;
     return handle;
   }
 
-  /** Move a hand's target. Throws on an inactive handle. */
+  /** Move a hand's target (hit point + drag). Throws on an inactive handle. */
   setGrabTarget(handle, x, y, z) {
     const hand = this.hands[handle];
     if (!hand || !hand.active) {
@@ -2014,6 +2412,22 @@ export class SoftBody {
     hand.target.x = x;
     hand.target.y = y;
     hand.target.z = z;
+  }
+
+  /**
+   * Set the hand's finger force, in units of the body's own weight. The solver
+   * turns it into a depth that depends on the material. Throws on an inactive
+   * handle or a non-finite / negative force.
+   */
+  setGrabPush(handle, force) {
+    const hand = this.hands[handle];
+    if (!hand || !hand.active) {
+      throw new Error(`SoftBody.setGrabPush: hand ${handle} is not active`);
+    }
+    if (!Number.isFinite(force) || force < 0) {
+      throw new Error(`SoftBody.setGrabPush requires a finite non-negative force; got ${force}`);
+    }
+    hand.push = force;
   }
 
   /** Re-select nodes around the hand's CURRENT target with the gaussian. */
@@ -2032,6 +2446,7 @@ export class SoftBody {
       throw new Error(`SoftBody.endGrab: hand ${handle} is not active`);
     }
     hand.active = false;
+    hand.push = 0;
     hand.count = 0;
   }
 
@@ -2138,6 +2553,7 @@ export class SoftBody {
   releaseAllHands() {
     for (let h = 0; h < this.hands.length; h++) {
       this.hands[h].active = false;
+      this.hands[h].push = 0;
       this.hands[h].count = 0;
     }
   }
@@ -2163,6 +2579,12 @@ export class SoftBody {
     this.substepCount = 0;
     this.shapeGoalReady = false;
     this.idleTime = 0;
+    this.impactPending = 0;
+    this.weldBreaksSinceUpdate = 0;
+    this.depthRateSum = 0;
+    this.stepsSinceUpdate = 0;
+    this.prevFloorContactCount = 0;
+    this.prevCentroidVelY = 0;
     this.accumVertexAreas(this.rest, this.restVertexArea);
     if (drop) this.drop(CONFIG.simulation.dropHeight);
     this.normalsDirty = true;
